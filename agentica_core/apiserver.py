@@ -20,6 +20,9 @@ remote (job.submit over ssh/SLURM, any ~/.ssh/config target).
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -229,6 +232,128 @@ def submit_remote(plan: dict, target: str, workspace: str) -> dict:
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# ollama setup / install / models  (defensive: these never raise to the caller)
+# --------------------------------------------------------------------------- #
+OLLAMA_HOME = Path(os.path.expanduser("~/.local/share/agentica/ollama"))
+
+
+def ollama_reachable(host: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def ollama_models(host: str, timeout: float = 4.0) -> list[str]:
+    try:
+        with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return []
+    names = {m.get("name") or m.get("model") for m in data.get("models", [])}
+    return sorted(n for n in names if n)
+
+
+def find_ollama_bin() -> str | None:
+    rootless = OLLAMA_HOME / "bin" / "ollama"
+    return shutil.which("ollama") or (str(rootless) if rootless.exists() else None)
+
+
+def model_present(model: str, models: list[str]) -> bool:
+    return (model in models or f"{model}:latest" in models
+            or (":" not in model and any(m.split(":")[0] == model for m in models)))
+
+
+def setup_status(state: "State") -> dict:
+    running = ollama_reachable(state.ollama_host)
+    models = ollama_models(state.ollama_host) if running else []
+    present = model_present(state.model, models)
+    return {
+        "ollama_installed": bool(find_ollama_bin()) or running,
+        "ollama_running": running,
+        "models": models,
+        "model": state.model,
+        "model_present": present,
+        "ready": running and present,
+    }
+
+
+def start_ollama(host: str, timeout_s: float = 25.0) -> tuple[bool, str]:
+    if ollama_reachable(host):
+        return True, "already running"
+    binp = find_ollama_bin()
+    if not binp:
+        return False, "ollama is not installed"
+    p = urlparse(host)
+    env = dict(os.environ)
+    env["OLLAMA_HOST"] = f"{p.hostname or '127.0.0.1'}:{p.port or 11434}"
+    lib = OLLAMA_HOME / "lib"
+    if lib.exists():
+        env["LD_LIBRARY_PATH"] = f"{lib}:{env.get('LD_LIBRARY_PATH', '')}"
+    try:
+        subprocess.Popen([binp, "serve"], env=env, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"could not start ollama: {exc}"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if ollama_reachable(host):
+            return True, "started"
+        time.sleep(0.5)
+    return False, "started but not reachable yet"
+
+
+def _zstd_decompress(src: Path, dst: Path) -> bool:
+    try:
+        import zstandard  # type: ignore
+
+        with open(src, "rb") as f, open(dst, "wb") as o:
+            zstandard.ZstdDecompressor().copy_stream(f, o)
+        return True
+    except ImportError:
+        pass
+    if shutil.which("zstd"):
+        return subprocess.run(["zstd", "-dqf", str(src), "-o", str(dst)]).returncode == 0
+    return False
+
+
+def install_ollama_rootless(progress) -> bool:
+    """Rootless Ollama install into ~/.local (no sudo). Reports progress via the
+    callback; designed to NEVER raise -- failures are reported and return False."""
+    try:
+        if find_ollama_bin():
+            progress("Ollama is already available.")
+            return True
+        arch = "amd64" if os.uname().machine in ("x86_64", "amd64") else "arm64"
+        url = f"https://github.com/ollama/ollama/releases/latest/download/ollama-linux-{arch}.tar.zst"
+        OLLAMA_HOME.mkdir(parents=True, exist_ok=True)
+        tarzst, tar = OLLAMA_HOME / "ollama.tar.zst", OLLAMA_HOME / "ollama.tar"
+        progress(f"Downloading rootless Ollama ({arch})...")
+        urllib.request.urlretrieve(url, tarzst)
+        progress("Decompressing...")
+        if not _zstd_decompress(tarzst, tar):
+            progress("ERROR: need `zstd` or python `zstandard` to unpack Ollama — "
+                     "install one, or get Ollama from https://ollama.com/download")
+            return False
+        progress("Extracting...")
+        subprocess.run(["tar", "-xf", str(tar), "-C", str(OLLAMA_HOME)], check=True)
+        for f in (tarzst, tar):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        if not (OLLAMA_HOME / "bin" / "ollama").exists():
+            progress("ERROR: extraction did not produce bin/ollama")
+            return False
+        progress("Installed rootless Ollama into ~/.local/share/agentica/ollama")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        progress(f"ERROR: install failed: {exc}")
+        return False
+
+
 def make_handler(state: State):
     class H(BaseHTTPRequestHandler):
         server_version = f"agentica-core/{__version__}"
@@ -259,12 +384,107 @@ def make_handler(state: State):
             n = int(self.headers.get("Content-Length", "0"))
             return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
 
+        # -- SSE streaming --
+        def _sse_start(self):
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+        def _sse(self, obj):
+            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+        def _stream_pull(self, model):
+            self._sse_start()
+            try:
+                req = urllib.request.Request(
+                    state.ollama_host.rstrip("/") + "/api/pull",
+                    data=json.dumps({"name": model, "stream": True}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=3600) as resp:
+                    for raw in resp:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            evt = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        self._sse(evt)
+                        if evt.get("status") == "success" or evt.get("error"):
+                            break
+                self._sse({"done": True})
+            except Exception as exc:  # noqa: BLE001
+                self._safe_sse({"error": str(exc), "done": True})
+
+        def _stream_install(self):
+            self._sse_start()
+            ok = install_ollama_rootless(lambda m: self._safe_sse({"status": m}))
+            if ok:
+                started, msg = start_ollama(state.ollama_host)
+                self._safe_sse({"status": msg, "ok": started})
+            self._safe_sse({"done": True, "ok": ok, **setup_status(state)})
+
+        def _stream_chat(self, body):
+            self._sse_start()
+            message = (body.get("message") or "").strip()
+            mode = body.get("mode", "agentic")
+            ws = body.get("workspace")
+            try:
+                if mode == "plain":
+                    msgs = []
+                    if ws:
+                        ctx = workspace_summary(ws)
+                        if ctx:
+                            msgs.append({"role": "system", "content": "Workspace context:\n" + ctx})
+                    msgs.append({"role": "user", "content": message})
+                    req = urllib.request.Request(
+                        state.ollama_host.rstrip("/") + "/v1/chat/completions",
+                        data=json.dumps({"model": state.model, "messages": msgs, "stream": True}).encode(),
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=600) as resp:
+                        for raw in resp:
+                            line = raw.decode("utf-8", "replace").strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
+                            if delta:
+                                self._sse({"delta": delta})
+                    self._sse({"done": True})
+                else:
+                    app = state.app_for(ws)
+                    res = app.chat(message, body.get("session_id"))
+                    self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
+                               "session_id": res.get("session_id"), "done": True})
+            except Exception as exc:  # noqa: BLE001
+                self._safe_sse({"error": str(exc), "done": True})
+
+        def _safe_sse(self, obj):
+            try:
+                self._sse(obj)
+            except Exception:  # noqa: BLE001 - client disconnected
+                pass
+
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
             try:
                 if u.path == "/api/health":
                     return self._json({"ok": True, "version": __version__, "model": state.model})
+                if u.path == "/api/setup":
+                    return self._json(setup_status(state))
+                if u.path == "/api/model/pull":
+                    return self._stream_pull((q.get("model") or [state.model])[0])
                 if u.path == "/api/hosts":
                     hosts = [{"alias": "local", "hostname": "this machine", "user": "",
                               "proxy_jump": "", "kind": "local"}]
@@ -291,6 +511,13 @@ def make_handler(state: State):
                 body = self._body()
                 if u.path == "/api/chat":
                     return self._json(self._chat(body))
+                if u.path == "/api/chat/stream":
+                    return self._stream_chat(body)
+                if u.path == "/api/ollama/start":
+                    ok, msg = start_ollama(state.ollama_host)
+                    return self._json({"ok": ok, "message": msg, **setup_status(state)})
+                if u.path == "/api/ollama/install":
+                    return self._stream_install()
                 if u.path == "/api/plan/draft":
                     return self._json(draft_plan(state, body.get("goal", ""), body.get("workspace")))
                 if u.path == "/api/plan/refine":
