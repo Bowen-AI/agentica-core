@@ -1,0 +1,45 @@
+# Real USC CARC Discovery cluster. SSH is driven entirely by ~/.ssh/config
+# (Host discovery.usc.edu / User bowenson) -- only the alias is needed here.
+name: discovery
+ssh:
+  host: discovery.usc.edu      # ~/.ssh/config alias; add proxy_jump: <bastion> for hops
+scheduler: slurm
+
+slurm:
+  partition: gpu
+  gpu_type: a40                # discovered: a100, a40, l40s, p100, v100 (a40 = most free nodes)
+  gpu_count: 1
+  cpus: 4
+  mem_mb: 16000
+  time_minutes: 20             # short -> backfills into free GPU slots quickly
+  account: paolieri_1347
+  job_name_prefix: agentic
+
+model:
+  engine: ollama
+  name: llama3.2:3b            # small + good tool-use; pulled/staged on the cluster
+  quantization: int4
+  max_model_len: 8192
+  serve_port: 11434
+
+resources:                     # from `slurm-agentic discover discovery.usc.edu`
+  partitions: [debug, epyc-64, gpu, htcondor, largemem, main, oneweek]
+  gpu_types: [a100, a40, l40s, p100, v100]
+  max_time_minutes: 2880
+
+gateway:
+  bind_host: 127.0.0.1
+  port: 8765
+  tunnel_port: 9434
+
+# ollama is user-space on Discovery (no system install); models cached on scratch.
+# `setup:` runs at the top of the sbatch body (compute node): load lmod+python,
+# put the staged rootless ollama on PATH, point OLLAMA_MODELS at scratch.
+setup:
+  - "source /etc/profile.d/modules.sh 2>/dev/null || true"
+  - "module load python/3.11.9 2>/dev/null || module load python 2>/dev/null || true"
+  - "export PATH=/scratch1/bowenson/ollama/bin:$PATH"
+  - "export LD_LIBRARY_PATH=/scratch1/bowenson/ollama/lib:${LD_LIBRARY_PATH:-}"
+  - "export OLLAMA_MODELS=/scratch1/bowenson/ollama-models"
+
+remote_workdir: /scratch1/bowenson/.slurm-agentic/jobs

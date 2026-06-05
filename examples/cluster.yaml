@@ -1,0 +1,46 @@
+# slurm-open-agentic cluster config: where/how to connect + serving knobs +
+# the "visible / allowed resources" manifest. See README and `slurm-agentic library`.
+name: lab-gpu
+
+ssh:
+  host: login.cluster.edu
+  user: me
+  port: 22
+  key_path: ~/.ssh/id_rsa
+
+slurm:
+  partition: gpu
+  gpu_type: a100        # gres type token; 'any' -> --gres=gpu:N
+  gpu_count: 1
+  cpus: 8
+  mem_mb: 32000
+  time_minutes: 120
+  job_name_prefix: agentic
+  # account: my-account
+  # extra_sbatch: ["--constraint=a100_80g"]
+
+model:                  # serving knobs -- see "Model deployment & GPU sizing strategy"
+  engine: ollama        # ollama (default, 1-2 GPU quantized) | vllm (TP/PP/multi-node)
+  name: qwen3.6         # popular default; `slurm-agentic library --gpu a100` to pick a fit
+  quantization: int4    # ampere(A40/A100) -> bf16|int4(awq/gptq); ada(L40S)/hopper -> fp8 ok
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  max_model_len: 8192
+  serve_port: 11434
+
+resources:              # visible / allowed manifest (hand-written or filled by `discover`)
+  partitions: [gpu, gpu-long]
+  gpu_types: [a100, l40s, a40]
+  max_gpus: 4
+  max_time_minutes: 480
+
+gateway:
+  bind_host: 127.0.0.1
+  port: 8765
+  tunnel_port: 9434
+
+auth:
+  token: null           # null -> open (MVP default); set a string to require Bearer on /v1 + /chat
+
+remote_workdir: ~/.slurm-agentic/jobs

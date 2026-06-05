@@ -1,0 +1,7 @@
+*.db
+outputs/
+__pycache__/
+.agentic/
+.claude/
+*.egg-info/
+job-artifacts/

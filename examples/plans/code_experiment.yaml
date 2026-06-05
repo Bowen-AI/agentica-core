@@ -1,0 +1,25 @@
+# Example agentic JOB (fully wired): implement a feature + prove it with tests.
+title: Add exponential-backoff retry to the API client
+kind: code
+goal: >
+  Implement a retry() helper with exponential backoff in src/client.py and a
+  fetch_with_retry() that uses it. Add unit tests proving it retries on failure
+  and eventually succeeds. All tests must pass.
+
+workspace: ./workspace        # rsynced to the node; relative to this plan file's dir at submit time
+
+checklist:
+  - "src/client.py defines retry() with exponential backoff"
+  - "src/client.py defines fetch_with_retry() that uses retry()"
+  - "tests cover: 2 failures then success, and exhausting all attempts raises"
+
+success_criteria:
+  tests: "python -m pytest -q"   # exit code 0 required (deterministic backstop)
+  artifacts: ["src/client.py", "tests/test_client.py"]
+
+# model + resources default to cluster.yaml when omitted
+# model: { engine: ollama, name: qwen3.6 }
+# resources: { gpus: 1, cpus: 8, mem_mb: 32000, time_minutes: 90 }
+
+max_iterations: 4
+max_steps_per_iteration: 14

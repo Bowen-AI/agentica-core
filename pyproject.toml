@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentica-core"
+version = "0.1.0"
+description = "Backend/runtime for Agentica: open-weight agentic AI + chat on local, SSH, or SLURM targets."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "agentica-core" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# agentic-loop is unpublished -> install it editable from the sibling checkout:
+#   pip install -e ../AgenticLocal
+# agentica_core also falls back to adding ../AgenticLocal to sys.path at import
+# time so the dev layout works without an explicit install.
+dependencies = [
+  "PyYAML>=6",
+]
+
+[project.scripts]
+agentica = "agentica_core.cli:main"
+slurm-agentic = "agentica_core.cli:main"  # back-compat alias
+
+[tool.setuptools.packages.find]
+include = ["agentica_core*"]

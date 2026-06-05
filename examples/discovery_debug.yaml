@@ -1,0 +1,32 @@
+# Fast-turnaround variant: the `debug` partition (1h max) for a quick real run when
+# the main `gpu` queue is congested. Same ssh-config + staged-ollama setup.
+name: discovery-debug
+ssh:
+  host: discovery.usc.edu
+scheduler: slurm
+
+slurm:
+  partition: debug
+  gpu_type: a40              # debug node b11-09 has a free a40 (fast Ampere; P100 too slow)
+  gpu_count: 1
+  cpus: 4
+  mem_mb: 16000
+  time_minutes: 20
+  account: paolieri_1347
+  job_name_prefix: agentic-dbg
+
+model:
+  engine: ollama
+  name: llama3.2:3b
+  max_model_len: 4096
+  timeout_s: 300             # generous per-request timeout
+  serve_port: 11434
+
+setup:
+  - "source /etc/profile.d/modules.sh 2>/dev/null || true"
+  - "module load python/3.11.9 2>/dev/null || module load python 2>/dev/null || true"
+  - "export PATH=/scratch1/bowenson/ollama/bin:$PATH"
+  - "export LD_LIBRARY_PATH=/scratch1/bowenson/ollama/lib:${LD_LIBRARY_PATH:-}"
+  - "export OLLAMA_MODELS=/scratch1/bowenson/ollama-models"
+
+remote_workdir: /scratch1/bowenson/.slurm-agentic/jobs

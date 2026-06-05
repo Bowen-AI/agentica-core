@@ -1,0 +1,173 @@
+"""Mode 2 -- submit an agentic JOB to SLURM and track it.
+
+``submit`` rsyncs the workspace + plan (and the agentica_core/agentic_loop source,
+so the cluster needs no pre-install) to a per-job dir, renders an sbatch that
+brings up ollama on the node and runs the Planner->Executor->Auditor loop, then
+submits it. ``status`` / ``logs`` / ``cancel`` track it.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+import agentic_loop
+
+from . import serving
+from .config import ClusterConfig, PlanConfig
+from .transport import Transport, TransportError
+
+import agentica_core
+
+
+def _package_root(module) -> Path:
+    return Path(module.__file__).resolve().parent  # the package dir itself
+
+
+def render_job_sbatch(cluster: ClusterConfig, plan: PlanConfig, remote_jobdir: str) -> str:
+    model = plan.effective_model(cluster)
+    res = plan.effective_resources(cluster)
+    gres = serving.gres_spec(ClusterConfig(name=cluster.name, ssh=cluster.ssh,
+                                           slurm=res, model=model,
+                                           resources=cluster.resources, gateway=cluster.gateway))
+    head = [
+        "#!/bin/bash -l",  # login shell so `module` works on the compute node
+        f"#SBATCH --job-name={res.job_name_prefix}-job",
+        f"#SBATCH --partition={res.partition}",
+        f"#SBATCH --gres={gres}",
+        f"#SBATCH --cpus-per-task={res.cpus}",
+        f"#SBATCH --mem={res.mem_mb}M",
+        f"#SBATCH --time={res.time_minutes}",
+        f"#SBATCH --output={remote_jobdir}/job-%j.out",
+    ]
+    if res.account:
+        head.append(f"#SBATCH --account={res.account}")
+    head.extend(f"#SBATCH {opt}" for opt in res.extra_sbatch)
+
+    port = model.serve_port
+    setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
+    body = setup + f"""set -uo pipefail
+echo "JOB_NODE=$(hostname)"
+export PYTHONPATH="{remote_jobdir}/code:${{PYTHONPATH:-}}"
+export OLLAMA_HOST=0.0.0.0:{port}
+export OLLAMA_KEEP_ALIVE=24h
+ollama serve &
+SERVE_PID=$!
+for i in $(seq 1 120); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
+ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist already)"
+python -m agentica_core.on_node_runner \\
+  --plan "{remote_jobdir}/plan.yaml" \\
+  --workspace "{remote_jobdir}/workspace" \\
+  --db "{remote_jobdir}/job.db" \\
+  --provider ollama --model "{model.name}" \\
+  --ollama-host "http://127.0.0.1:{port}" \\
+  --model-timeout {model.timeout_s} \\
+  --checkpoint-dir "{remote_jobdir}/checkpoints" \\
+  --result "{remote_jobdir}/result.json"
+RC=$?
+kill $SERVE_PID 2>/dev/null || true
+echo "JOB_DONE rc=$RC"
+exit $RC
+"""
+    return "\n".join(head) + "\n\n" + body
+
+
+def submit(cluster_path: str, plan_path: str, *, sync_code: bool = True, _print=print) -> int:
+    cluster = ClusterConfig.resolve(cluster_path)
+    plan = PlanConfig.load(plan_path)
+
+    fit = serving.preflight(cluster, plan.effective_model(cluster))
+    _print(f"[preflight] {fit.message}")
+    for w in fit.warnings:
+        _print(f"[preflight] ! {w}")
+    if fit.verdict == "won't fit":
+        _print("[preflight] Refusing to submit: model does not fit. Adjust plan/cluster resources.")
+        return 2
+
+    transport = Transport.from_cluster(cluster)
+    remote_jobdir = f"{cluster.remote_workdir}/job-{uuid.uuid4().hex[:8]}"
+    transport.exec(f"mkdir -p {remote_jobdir}/workspace {remote_jobdir}/code").check("mkdir remote jobdir")
+
+    # Stage workspace + plan.
+    ws = Path(plan.workspace)
+    if ws.exists():
+        _print(f"[stage] rsync workspace {ws} -> {remote_jobdir}/workspace")
+        transport.push_dir(str(ws), f"{remote_jobdir}/workspace").check("rsync workspace")
+    transport.exec(serving._write_remote_file(  # noqa: SLF001 - reuse heredoc helper
+        f"{remote_jobdir}/plan.yaml", Path(plan_path).read_text(encoding="utf-8"))).check("write plan.yaml")
+
+    # Stage code so the cluster needs no pre-install.
+    if sync_code:
+        for mod in (agentica_core, agentic_loop):
+            root = _package_root(mod)
+            _print(f"[stage] rsync {root.name} -> {remote_jobdir}/code/{root.name}")
+            transport.exec(f"mkdir -p {remote_jobdir}/code/{root.name}").check("mkdir code dir")
+            transport.push_dir(str(root), f"{remote_jobdir}/code/{root.name}").check(f"rsync {root.name}")
+
+    # Render + submit.
+    script = render_job_sbatch(cluster, plan, remote_jobdir)
+    transport.exec(serving._write_remote_file(  # noqa: SLF001
+        f"{remote_jobdir}/job.sbatch", script)).check("write job.sbatch")
+    job_id = transport.sbatch(f"{remote_jobdir}/job.sbatch")
+    transport.exec(serving._write_remote_file(  # noqa: SLF001 - record jobdir for status/logs
+        f"{remote_jobdir}/jobid.txt", job_id)).check("write jobid")
+
+    _print("")
+    _print(f"[submitted] job_id={job_id}  jobdir={remote_jobdir}")
+    _print(f"  status: slurm-agentic job status {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
+    _print(f"  logs:   slurm-agentic job logs   {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
+    _print(f"  cancel: slurm-agentic job cancel {cluster_path} --job {job_id}")
+    return 0
+
+
+def status(cluster_path: str, job_id: str, jobdir: str | None = None, _print=print) -> int:
+    cluster = ClusterConfig.resolve(cluster_path)
+    transport = Transport.from_cluster(cluster)
+    info = transport.squeue_job(job_id)
+    state = info.get("state") or transport.sacct_state(job_id)
+    _print(f"job {job_id}: state={state} node={info.get('nodelist', '-')}")
+    if jobdir:
+        res = transport.exec(f"cat {jobdir}/result.json 2>/dev/null || true")
+        if res.out.strip():
+            try:
+                data = json.loads(res.out)
+                _print(f"  result: passed={data.get('passed')} iterations={data.get('iterations')} "
+                       f"verdict={data.get('verdict')} tests_ok={data.get('tests_ok')}")
+            except json.JSONDecodeError:
+                _print("  result.json present but not parseable yet")
+        else:
+            _print("  (no result.json yet)")
+    return 0
+
+
+def logs(cluster_path: str, job_id: str, jobdir: str | None = None, tail: int = 80, _print=print) -> int:
+    cluster = ClusterConfig.resolve(cluster_path)
+    transport = Transport.from_cluster(cluster)
+    if not jobdir:
+        _print("Pass --jobdir to read logs (printed at submit time).")
+        return 1
+    res = transport.exec(f"tail -n {tail} {jobdir}/job-{job_id}.out 2>/dev/null || "
+                         f"tail -n {tail} {jobdir}/job-*.out 2>/dev/null || true")
+    _print(res.out or "(no log yet)")
+    return 0
+
+
+def cancel(cluster_path: str, job_id: str, _print=print) -> int:
+    cluster = ClusterConfig.resolve(cluster_path)
+    transport = Transport.from_cluster(cluster)
+    res = transport.scancel(job_id)
+    _print(f"scancel {job_id}: rc={res.rc} {res.err.strip()}")
+    return 0 if res.ok else 1
+
+
+def fetch_artifacts(cluster_path: str, jobdir: str, local_dir: str, _print=print) -> int:
+    cluster = ClusterConfig.resolve(cluster_path)
+    transport = Transport.from_cluster(cluster)
+    try:
+        transport.pull_dir(f"{jobdir}/workspace", local_dir).check("rsync artifacts back")
+    except TransportError as exc:
+        _print(f"fetch failed: {exc}")
+        return 1
+    _print(f"artifacts synced to {local_dir}")
+    return 0

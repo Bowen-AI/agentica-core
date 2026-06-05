@@ -1,0 +1,1298 @@
+{
+  "models": [
+    "qwen3.5:9b",
+    "gemma4:e4b",
+    "gemma4:e2b"
+  ],
+  "repeats": 5,
+  "tasks": [
+    "J1-hello",
+    "J2-add",
+    "J3-greet",
+    "J4-json",
+    "J5-reverse",
+    "J6-fixbug",
+    "J7-readme",
+    "J8-count",
+    "J9-fizzbuzz",
+    "J10-video"
+  ],
+  "host": "http://127.0.0.1:11434",
+  "raw": [
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 37.94,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 46.53,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 49.69,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 32.85,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 44.98,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J6-fixbug",
+      "passed": true,
+      "secs": 53.32,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 72.2,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=2"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 48.86,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 60.83,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 1,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 34.54,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 29.13,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 49.76,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 52.26,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 37.29,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 49.51,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J6-fixbug",
+      "passed": true,
+      "secs": 41.94,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 35.12,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 48.54,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 48.65,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 2,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 36.98,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 39.23,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 32.74,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 45.75,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 25.6,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 45.59,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J6-fixbug",
+      "passed": true,
+      "secs": 50.73,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 26.25,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 28.23,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 58.21,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 3,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 41.86,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 32.09,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 42.27,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 52.39,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 27.08,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 42.75,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J6-fixbug",
+      "passed": true,
+      "secs": 29.91,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 35.58,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 72.22,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=2"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 49.53,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 4,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 35.94,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 28.04,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 49.45,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 51.5,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 26.97,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 38.23,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J6-fixbug",
+      "passed": true,
+      "secs": 68.19,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 34.22,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 48.86,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 36.74,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "qwen3.5:9b",
+      "rep": 5,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 36.15,
+      "detail": "verdict=PASS tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 26.26,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 10.76,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 10.37,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 8.27,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 19.25,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 11.87,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 5.89,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 44.2,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 21.51,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 1,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 5.88,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 8.99,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 6.7,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 7.0,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 9.73,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 10.71,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 10.84,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 5.57,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 14.41,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 17.69,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 2,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 6.26,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 7.73,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 9.04,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 10.85,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 6.2,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 6.58,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 9.09,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 6.65,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 30.12,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 41.98,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 3,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 6.72,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 7.11,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 8.2,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 13.22,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 9.67,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 13.97,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 12.79,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 5.79,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 11.35,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 55.14,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 4,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 5.8,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 5.5,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 9.32,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 12.73,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 8.55,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 15.11,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 8.96,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 9.32,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 17.93,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 66.2,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e4b",
+      "rep": 5,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 5.91,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 22.39,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 6.33,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 6.99,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 7.47,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 13.8,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 11.42,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 6.22,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 15.76,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 31.62,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 1,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 4.58,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 4.81,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 6.64,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 8.3,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 6.28,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 7.84,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 12.71,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 5.62,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 14.88,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 26.6,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 2,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 6.12,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 4.21,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 5.97,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 8.33,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 7.51,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 9.4,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 11.82,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 7.91,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J8-count",
+      "passed": true,
+      "secs": 18.66,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 31.89,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 3,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 6.09,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 5.01,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 6.01,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 6.26,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 5.87,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 10.22,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 12.24,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 5.74,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 7.95,
+      "detail": "verdict=NONE tests_ok=False arts_ok=False iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 19.68,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 4,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 5.87,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J1-hello",
+      "passed": true,
+      "secs": 5.36,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J2-add",
+      "passed": true,
+      "secs": 7.03,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J3-greet",
+      "passed": true,
+      "secs": 6.55,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J4-json",
+      "passed": true,
+      "secs": 7.91,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J5-reverse",
+      "passed": true,
+      "secs": 11.37,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J6-fixbug",
+      "passed": false,
+      "secs": 12.77,
+      "detail": "verdict=NONE tests_ok=False arts_ok=True iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J7-readme",
+      "passed": true,
+      "secs": 6.75,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J8-count",
+      "passed": false,
+      "secs": 8.09,
+      "detail": "verdict=NONE tests_ok=False arts_ok=False iters=2"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J9-fizzbuzz",
+      "passed": true,
+      "secs": 31.68,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    },
+    {
+      "model": "gemma4:e2b",
+      "rep": 5,
+      "task": "J10-video",
+      "passed": true,
+      "secs": 6.4,
+      "detail": "verdict=NONE tests_ok=True arts_ok=True iters=1"
+    }
+  ],
+  "aggregate": {
+    "per_model": {
+      "qwen3.5:9b": {
+        "runs": 50,
+        "pass": 50,
+        "pass_rate": 100.0,
+        "avg_secs": 42.9,
+        "per_task": {
+          "J1-hello": 100.0,
+          "J2-add": 100.0,
+          "J3-greet": 100.0,
+          "J4-json": 100.0,
+          "J5-reverse": 100.0,
+          "J6-fixbug": 100.0,
+          "J7-readme": 100.0,
+          "J8-count": 100.0,
+          "J9-fizzbuzz": 100.0,
+          "J10-video": 100.0
+        }
+      },
+      "gemma4:e4b": {
+        "runs": 50,
+        "pass": 41,
+        "pass_rate": 82.0,
+        "avg_secs": 14.0,
+        "per_task": {
+          "J1-hello": 100.0,
+          "J2-add": 100.0,
+          "J3-greet": 100.0,
+          "J4-json": 100.0,
+          "J5-reverse": 100.0,
+          "J6-fixbug": 0.0,
+          "J7-readme": 100.0,
+          "J8-count": 20.0,
+          "J9-fizzbuzz": 100.0,
+          "J10-video": 100.0
+        }
+      },
+      "gemma4:e2b": {
+        "runs": 50,
+        "pass": 43,
+        "pass_rate": 86.0,
+        "avg_secs": 10.5,
+        "per_task": {
+          "J1-hello": 100.0,
+          "J2-add": 100.0,
+          "J3-greet": 100.0,
+          "J4-json": 100.0,
+          "J5-reverse": 100.0,
+          "J6-fixbug": 0.0,
+          "J7-readme": 100.0,
+          "J8-count": 60.0,
+          "J9-fizzbuzz": 100.0,
+          "J10-video": 100.0
+        }
+      }
+    },
+    "ranking": [
+      "qwen3.5:9b",
+      "gemma4:e2b",
+      "gemma4:e4b"
+    ],
+    "tasks": [
+      "J1-hello",
+      "J2-add",
+      "J3-greet",
+      "J4-json",
+      "J5-reverse",
+      "J6-fixbug",
+      "J7-readme",
+      "J8-count",
+      "J9-fizzbuzz",
+      "J10-video"
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+# Example agentic JOB (pluggable stub): image/text -> video generation.
+# generate_video / generate_image use a STUB backend by default (writes a
+# placeholder file + records intent). Swap slurm_tools.create_job_tools(
+# diffusion_backend=...) for a real ComfyUI/diffusers worker (e.g. Wan2.2-TI2V-5B
+# + FLUX.1-schnell on a 48GB card -- see `slurm-agentic library --gpu l40s`).
+title: Generate a short video from a prompt image and caption
+kind: video
+goal: >
+  Using generate_video, produce output/clip.mp4 from input/scene.png with the
+  prompt "a calm timelapse of clouds over mountains, cinematic". Then confirm the
+  artifact exists.
+
+workspace: ./workspace
+
+checklist:
+  - "output/clip.mp4 is produced by generate_video"
+
+success_criteria:
+  # no test command; completion is gated on the artifact + auditor verdict
+  artifacts: ["output/clip.mp4"]
+
+# For a real run, point at a diffusion-capable node + model:
+# model: { engine: vllm, name: wan2.2-ti2v-5b }   # served via ComfyUI worker (Slice 6)
+# resources: { gpus: 1, mem_mb: 64000, time_minutes: 60 }
+
+max_iterations: 2
+max_steps_per_iteration: 8
