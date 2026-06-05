@@ -123,6 +123,15 @@ class Transport:
             raise TransportError(f"executable not found: {exc}") from exc
         return ExecResult(proc.returncode, proc.stdout, proc.stderr)
 
+    def expand_home(self, path: str) -> str:
+        """Resolve a leading ``~`` to the remote/local absolute $HOME, so it is safe
+        to bake into PYTHONPATH / scripts where the shell won't expand it."""
+        if path.startswith("~"):
+            home = self.exec("echo $HOME", timeout=30).out.strip()
+            if home:
+                return home + path[1:]
+        return path
+
     # -- file staging (rsync; falls back to plain cp locally) --
     def push_dir(self, local_dir: str, remote_dir: str, delete: bool = False) -> ExecResult:
         return self._rsync(local_dir.rstrip("/") + "/", remote_dir, to_remote=True, delete=delete)

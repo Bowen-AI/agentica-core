@@ -86,7 +86,8 @@ def submit(cluster_path: str, plan_path: str, *, sync_code: bool = True, _print=
         return 2
 
     transport = Transport.from_cluster(cluster)
-    remote_jobdir = f"{cluster.remote_workdir}/job-{uuid.uuid4().hex[:8]}"
+    scheduler = serving.detect_scheduler(transport, cluster)
+    remote_jobdir = transport.expand_home(f"{cluster.remote_workdir}/job-{uuid.uuid4().hex[:8]}")
     transport.exec(f"mkdir -p {remote_jobdir}/workspace {remote_jobdir}/code").check("mkdir remote jobdir")
 
     # Stage workspace + plan.
@@ -105,7 +106,10 @@ def submit(cluster_path: str, plan_path: str, *, sync_code: bool = True, _print=
             transport.exec(f"mkdir -p {remote_jobdir}/code/{root.name}").check("mkdir code dir")
             transport.push_dir(str(root), f"{remote_jobdir}/code/{root.name}").check(f"rsync {root.name}")
 
-    # Render + submit.
+    if scheduler == "ssh":
+        return _submit_ssh(transport, cluster, plan, remote_jobdir, cluster_path, _print)
+
+    # SLURM: render + sbatch.
     script = render_job_sbatch(cluster, plan, remote_jobdir)
     transport.exec(serving._write_remote_file(  # noqa: SLF001
         f"{remote_jobdir}/job.sbatch", script)).check("write job.sbatch")
@@ -115,29 +119,77 @@ def submit(cluster_path: str, plan_path: str, *, sync_code: bool = True, _print=
 
     _print("")
     _print(f"[submitted] job_id={job_id}  jobdir={remote_jobdir}")
-    _print(f"  status: slurm-agentic job status {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
-    _print(f"  logs:   slurm-agentic job logs   {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
-    _print(f"  cancel: slurm-agentic job cancel {cluster_path} --job {job_id}")
+    _print(f"  status: agentica job status {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
+    _print(f"  logs:   agentica job logs   {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
+    _print(f"  cancel: agentica job cancel {cluster_path} --job {job_id}")
+    return 0
+
+
+def _ssh_runner_script(cluster: ClusterConfig, plan: PlanConfig, remote_jobdir: str) -> str:
+    """Run the Planner->Executor->Auditor loop on a plain GPU box (no SLURM)."""
+    model = plan.effective_model(cluster)
+    port = model.serve_port
+    setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
+    return f"""#!/bin/bash
+set -uo pipefail
+cd {remote_jobdir}
+{setup}export PYTHONPATH="{remote_jobdir}/code:${{PYTHONPATH:-}}"
+PY=$(command -v python3.12 || command -v python3.11 || command -v python3)
+export OLLAMA_HOST=0.0.0.0:{port}
+export OLLAMA_KEEP_ALIVE=24h
+(curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 || (nohup ollama serve >{remote_jobdir}/ollama.log 2>&1 &))
+for i in $(seq 1 90); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
+ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist)"
+"$PY" -m agentica_core.on_node_runner \\
+  --plan "{remote_jobdir}/plan.yaml" --workspace "{remote_jobdir}/workspace" \\
+  --db "{remote_jobdir}/job.db" --provider ollama --model "{model.name}" \\
+  --ollama-host "http://127.0.0.1:{port}" --model-timeout {model.timeout_s} \\
+  --result "{remote_jobdir}/result.json"
+echo "JOB_DONE rc=$?" > {remote_jobdir}/done.marker
+"""
+
+
+def _submit_ssh(transport: Transport, cluster: ClusterConfig, plan: PlanConfig,
+                remote_jobdir: str, cluster_path: str, _print) -> int:
+    transport.exec(serving._write_remote_file(  # noqa: SLF001
+        f"{remote_jobdir}/runner.sh", _ssh_runner_script(cluster, plan, remote_jobdir))).check("write runner.sh")
+    # Launch detached so it survives the ssh disconnect.
+    transport.exec(f"cd {remote_jobdir} && nohup bash runner.sh >runner.log 2>&1 & echo launched").check("launch ssh job")
+    job_id = Path(remote_jobdir).name
+    _print("")
+    _print(f"[submitted] job_id={job_id}  jobdir={remote_jobdir}   (ssh: {cluster.ssh.host})")
+    _print(f"  status: agentica job status {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
+    _print(f"  logs:   agentica job logs   {cluster_path} --job {job_id} --jobdir {remote_jobdir}")
     return 0
 
 
 def status(cluster_path: str, job_id: str, jobdir: str | None = None, _print=print) -> int:
     cluster = ClusterConfig.resolve(cluster_path)
     transport = Transport.from_cluster(cluster)
-    info = transport.squeue_job(job_id)
-    state = info.get("state") or transport.sacct_state(job_id)
-    _print(f"job {job_id}: state={state} node={info.get('nodelist', '-')}")
+    # Result file is authoritative for both ssh and finished SLURM jobs.
     if jobdir:
         res = transport.exec(f"cat {jobdir}/result.json 2>/dev/null || true")
         if res.out.strip():
             try:
                 data = json.loads(res.out)
+                _print(f"job {job_id}: state=COMPLETED")
                 _print(f"  result: passed={data.get('passed')} iterations={data.get('iterations')} "
                        f"verdict={data.get('verdict')} tests_ok={data.get('tests_ok')}")
+                return 0
             except json.JSONDecodeError:
-                _print("  result.json present but not parseable yet")
-        else:
-            _print("  (no result.json yet)")
+                pass
+        marker = transport.exec(f"cat {jobdir}/done.marker 2>/dev/null || true")
+        if marker.out.strip():
+            _print(f"job {job_id}: {marker.out.strip()} (finished; no result.json — check logs)")
+            return 0
+    info = transport.squeue_job(job_id)
+    if info:
+        _print(f"job {job_id}: state={info.get('state')} node={info.get('nodelist', '-')}")
+    else:
+        # no scheduler info (ssh box) and no result yet -> still running, or unknown
+        sacct = transport.sacct_state(job_id)
+        state = "RUNNING" if sacct == "UNKNOWN" else sacct
+        _print(f"job {job_id}: state={state} (no result.json yet)")
     return 0
 
 
@@ -147,8 +199,9 @@ def logs(cluster_path: str, job_id: str, jobdir: str | None = None, tail: int = 
     if not jobdir:
         _print("Pass --jobdir to read logs (printed at submit time).")
         return 1
-    res = transport.exec(f"tail -n {tail} {jobdir}/job-{job_id}.out 2>/dev/null || "
-                         f"tail -n {tail} {jobdir}/job-*.out 2>/dev/null || true")
+    res = transport.exec(
+        f"tail -n {tail} {jobdir}/job-*.out 2>/dev/null || "      # slurm
+        f"tail -n {tail} {jobdir}/runner.log 2>/dev/null || true")  # ssh
     _print(res.out or "(no log yet)")
     return 0
 

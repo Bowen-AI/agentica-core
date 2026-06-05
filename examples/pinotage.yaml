@@ -1,0 +1,11 @@
+# Plain GPU box (no SLURM) reached via ~/.ssh/config. ollama is already installed.
+name: pinotage
+ssh:
+  host: pinotage.usc.edu
+scheduler: ssh
+model:
+  engine: ollama
+  name: llama3.2:3b
+  timeout_s: 300
+  max_model_len: 4096
+remote_workdir: ~/.agentica/jobs

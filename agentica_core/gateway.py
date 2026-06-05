@@ -307,7 +307,7 @@ def up(
 
     # Full path: bring up the model on the cluster, then tunnel.
     transport = Transport.from_cluster(cluster)
-    remote_jobdir = f"{cluster.remote_workdir}/serve-{uuid.uuid4().hex[:8]}"
+    remote_jobdir = transport.expand_home(f"{cluster.remote_workdir}/serve-{uuid.uuid4().hex[:8]}")
     _print(f"[serve] submitting serve job on {cluster.ssh.host} ({cluster.model.engine} {model_name})...")
     handle = serving.bring_up(transport, cluster, remote_jobdir, model=fit_model, wait_timeout_s=serve_wait_s)
     _print(f"[serve] job {handle.job_id} running on node {handle.node}:{handle.port}")

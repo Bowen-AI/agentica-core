@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install agentic-loop (AgenticLocal) engine
+        run: pip install "git+https://github.com/Bowen-AI/AgenticLocal.git"
+
+      - name: Install agentica-core + test deps
+        run: pip install -e . pytest
+
+      - name: Unit + offline e2e tests
+        run: python -m pytest tests/ -q
+
+      - name: GPU-vs-model library is self-consistent
+        run: python -c "from agentica_core import catalog; bad=catalog.validate_library(); assert not bad, bad; print(len(catalog.PRESETS), 'presets OK')"
+
+      - name: CLI smoke
+        run: |
+          python -m agentica_core.cli fit qwen3-32b a100-80 --quant int4
+          python -m agentica_core.cli library --gpu l40s
