@@ -10,6 +10,7 @@ signal that can additionally fail an otherwise-green run for incompleteness.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import subprocess
 import sys
@@ -57,6 +58,11 @@ def run_job(
     workspace_path = Path(workspace).resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(db_path)
+    sc = plan.success_criteria
+    # Tamper-evidence: capture pristine bytes of seeded grader/fixture files BEFORE the
+    # agent can touch them, so the backstop always scores against the original (the
+    # executor has write_roots=["."] + shell, so "don't edit the test" can't be honor-system).
+    protected = _snapshot_protected(workspace_path, sc.protect, _print)
     # Build the ollama adapter with a configurable timeout (slow GPUs need more).
     if model is None and provider == "ollama" and model_name:
         model = OllamaChatModel(model=model_name, host=ollama_host, timeout_s=model_timeout)
@@ -99,9 +105,12 @@ def run_job(
         note(f"[executor] iteration {i}/{plan.max_iterations}")
         controller.run(executor_goal, workflow_key="executor")
 
-        # Deterministic backstops (authoritative).
-        tests_ok = _run_tests_command(plan.success_criteria.tests, workspace_path, note)
-        artifacts_ok = _artifacts_ok(plan.success_criteria.artifacts, workspace_path)
+        # Deterministic backstops (authoritative). Restore any tampered grader/fixture
+        # files to their pristine copy first, then score against them.
+        _restore_protected(workspace_path, protected, note)
+        tests_ok = _run_tests_command(sc.tests, workspace_path, note,
+                                      success_token=sc.tests_success_token)
+        artifacts_ok = _artifacts_ok(sc.artifacts, workspace_path, symbols=sc.artifact_symbols)
         note(f"[backstop] tests_ok={tests_ok} artifacts_ok={artifacts_ok}")
 
         # Auditor (model verdict; structured channel only).
@@ -153,7 +162,35 @@ def _extract_audit_verdict(result) -> tuple[str, str]:
     return "NONE", ""
 
 
-def _run_tests_command(command: str | None, cwd: Path, note) -> bool:
+def _snapshot_protected(workspace: Path, protect: list[str], _print) -> dict[str, bytes]:
+    """Capture pristine bytes of seeded grader/fixture files before the agent runs."""
+    snap: dict[str, bytes] = {}
+    for rel in protect or []:
+        p = workspace / rel
+        if p.is_file():
+            snap[rel] = p.read_bytes()
+        else:
+            _print(f"[backstop] WARNING: protected file not found at job start: {rel}")
+    if snap:
+        _print(f"[backstop] tamper-guarding {len(snap)} seeded file(s): {sorted(snap)}")
+    return snap
+
+
+def _restore_protected(workspace: Path, snapshot: dict[str, bytes], note) -> None:
+    """Restore pristine copies before scoring; flag any file the agent altered/removed."""
+    for rel, original in (snapshot or {}).items():
+        p = workspace / rel
+        try:
+            current = p.read_bytes() if p.is_file() else None
+        except OSError:
+            current = None
+        if current != original:
+            note(f"[backstop] TAMPER: protected file {rel!r} was modified/removed -> restoring pristine copy")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(original)
+
+
+def _run_tests_command(command: str | None, cwd: Path, note, *, success_token: str | None = None) -> bool:
     if not command:
         return True  # no tests configured -> not a gate
     try:
@@ -164,14 +201,40 @@ def _run_tests_command(command: str | None, cwd: Path, note) -> bool:
         return False
     if proc.returncode != 0:
         note(f"[backstop] tests exit={proc.returncode}: {proc.stdout[-300:]}{proc.stderr[-300:]}")
-    return proc.returncode == 0
+        return False
+    # Exit-0 is necessary but not sufficient: an optional success token in stdout closes
+    # the "reduce the test to print('OK')/sys.exit(0)" gaming gap.
+    if success_token and success_token not in proc.stdout:
+        note(f"[backstop] tests exited 0 but required token {success_token!r} not in stdout -> FAIL")
+        return False
+    return True
 
 
-def _artifacts_ok(artifacts: list[str], cwd: Path) -> bool:
+def _artifacts_ok(artifacts: list[str], cwd: Path, *, symbols: dict | None = None) -> bool:
     for rel in artifacts or []:
         if not (cwd / rel).exists():
             return False
+    # Content check: a required artifact must DEFINE the named symbols (not just exist),
+    # so an empty/stub file no longer satisfies the gate.
+    for rel, required in (symbols or {}).items():
+        if not _defines_symbols(cwd / rel, required):
+            return False
     return True
+
+
+def _defines_symbols(path: Path, required: list[str]) -> bool:
+    """True iff the python file defines every required top-level name (def/class/assignment)."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError, UnicodeDecodeError):
+        return False
+    defined: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return all(name in defined for name in (required or []))
 
 
 def _checkpoint(checkpoint_dir: str | None, name: str, data: dict) -> None:

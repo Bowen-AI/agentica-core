@@ -69,7 +69,7 @@ def main() -> int:
         check("/health 200", s == 200 and '"ok": true' in b)
 
         s, b = _req(f"{base}/")
-        check("/ serves chat HTML", s == 200 and "slurm-open-agentic" in b)
+        check("/ serves chat HTML", s == 200 and "agentica-core" in b)
 
         s, b = _req(f"{base}/v1/models")  # no token -> 401 (authed route)
         check("/v1/models requires auth", s == 401, f"got {s}")

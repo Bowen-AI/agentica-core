@@ -31,6 +31,25 @@ def test_setup_status(monkeypatch):
     assert s2["ollama_running"] and not s2["model_present"] and not s2["ready"]
 
 
+def test_resolve_model_keeps_configured_when_present(monkeypatch):
+    monkeypatch.setattr(apiserver, "ollama_models", lambda h, **k: ["qwen3.5:4b-mlx", "gemma4:e4b"])
+    assert _state("qwen3.5:4b-mlx").resolve_model() == "qwen3.5:4b-mlx"
+
+
+def test_resolve_model_falls_back_to_installed_when_absent(monkeypatch):
+    # configured model missing -> prefer same family, then qwen*, then first installed
+    monkeypatch.setattr(apiserver, "ollama_models", lambda h, **k: ["gemma4:e4b", "qwen3.5:9b"])
+    assert _state("qwen3.5:4b-mlx").resolve_model() == "qwen3.5:9b"   # same qwen family
+    monkeypatch.setattr(apiserver, "ollama_models", lambda h, **k: ["gemma4:e4b"])
+    assert _state("llama3.2:3b").resolve_model() == "gemma4:e4b"       # first installed
+
+
+def test_resolve_model_keeps_configured_when_ollama_empty(monkeypatch):
+    # Ollama down/empty: don't invent a model; Setup flow guides the user to pull it.
+    monkeypatch.setattr(apiserver, "ollama_models", lambda h, **k: [])
+    assert _state("qwen3.5:4b-mlx").resolve_model() == "qwen3.5:4b-mlx"
+
+
 def test_setup_status_when_ollama_down(monkeypatch):
     monkeypatch.setattr(apiserver, "ollama_reachable", lambda h, **k: False)
     monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: None)

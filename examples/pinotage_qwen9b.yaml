@@ -1,0 +1,12 @@
+# pinotage with the stronger qwen3.5:9b model (benchmark's 100%-pass local model)
+# for genuinely complex agentic coding jobs. Same plain-GPU-box (ssh) path.
+name: pinotage-qwen9b
+ssh:
+  host: pinotage.usc.edu
+scheduler: ssh
+model:
+  engine: ollama
+  name: qwen3.5:9b
+  timeout_s: 600
+  max_model_len: 8192
+remote_workdir: ~/.agentica/jobs

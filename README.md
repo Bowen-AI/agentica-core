@@ -1,9 +1,7 @@
 # agentica-core
 
-> Repo being renamed `slurm-open-agentic` → **agentica-core** (the backend/runtime
-> for the [Agentica](../Agentica) UI). The Python package is `agentica_core` and the
-> CLI is `agentica` (`slurm-agentic` still works as an alias). To finish the rename:
-> rename the GitHub repo, then `mv slurm-open-agentic agentica-core` locally.
+> Backend/runtime for the [Agentica](../Agentica) UI. The Python package is
+> `agentica_core` and the CLI is `agentica` (`slurm-agentic` remains a back-compat alias).
 
 Run **open-weight agentic AI + chat on local, SSH, or SLURM targets** described by a
 `cluster.yaml` or a bare `~/.ssh/config` alias. Built on [AgenticLocal](../AgenticLocal)'s

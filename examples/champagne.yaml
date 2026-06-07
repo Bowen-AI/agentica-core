@@ -1,0 +1,13 @@
+# Plain GPU box (no SLURM) reached via ~/.ssh/config. Unlike pinotage, this box
+# starts cold: the on-node runner auto-starts `ollama serve` and pulls the model
+# on first run (proves the cold-box bootstrap path).
+name: champagne
+ssh:
+  host: champagne.usc.edu
+scheduler: ssh
+model:
+  engine: ollama
+  name: llama3.2:3b
+  timeout_s: 300
+  max_model_len: 4096
+remote_workdir: ~/.agentica/jobs

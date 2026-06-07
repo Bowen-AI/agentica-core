@@ -1,0 +1,26 @@
+# Complex agentic coding job (stdlib-only, deterministic backstop): implement a
+# module so a SEEDED spec-test passes — the realistic "make the test green" loop.
+# Run on a capable model (qwen3.5:9b) over ssh; the small models often need >1 iter.
+title: Retry helper with exponential backoff
+kind: code
+goal: >
+  Implement retry_util.py in the workspace. It must define exactly:
+  (1) retry(fn, attempts=3, base_delay=0.0): call fn() and return its result on success;
+  if fn() raises, sleep base_delay*(2**i) seconds (i = 0-based retry index) then try again,
+  up to `attempts` total calls; if every attempt raises, re-raise the last exception.
+  (2) fetch_with_retry(fn, attempts=3): a wrapper returning retry(fn, attempts=attempts, base_delay=0.0).
+  A seeded test_retry.py already encodes the spec — make it pass. Do NOT modify test_retry.py.
+workspace: examples/plans/ws_retry      # rsynced to the node (contains test_retry.py)
+checklist:
+  - "retry_util.py defines retry(fn, attempts=3, base_delay=0.0) with exponential backoff"
+  - "retry_util.py defines fetch_with_retry(fn, attempts=3) that uses retry"
+  - "test_retry.py passes: fail-twice-then-succeed, always-fail-raises, first-success-one-call"
+success_criteria:
+  tests: "python3 test_retry.py"
+  tests_success_token: "OK all retry tests passed"   # exit 0 alone isn't enough (anti-gaming)
+  protect: ["test_retry.py"]                          # seeded grader is restored if the agent edits it
+  artifact_symbols:                                   # retry_util.py must DEFINE these (not just exist)
+    retry_util.py: ["retry", "fetch_with_retry"]
+  artifacts: ["retry_util.py"]
+max_iterations: 3
+max_steps_per_iteration: 10

@@ -28,7 +28,7 @@ _TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>slurm-open-agentic chat</title>
+<title>agentica-core chat</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -57,7 +57,7 @@ _TEMPLATE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>slurm-open-agentic</h1>
+  <h1>agentica-core</h1>
   <span class="model">model: __MODEL__ &middot; v__VERSION__</span>
   <span class="spacer"></span>
   <button class="secondary" id="apiBtn">Show &amp; copy API</button>
@@ -139,7 +139,7 @@ const apiKey = document.getElementById('apiKey');
 apiBase.textContent = CFG.apiBase;
 apiKey.textContent = CFG.token ? CFG.token : '(none — open access)';
 document.getElementById('snippet').textContent = JSON.stringify({
-  models: [{ title: 'slurm-open-agentic', provider: 'openai', model: CFG.model,
+  models: [{ title: 'agentica-core', provider: 'openai', model: CFG.model,
              apiBase: CFG.apiBase, apiKey: CFG.token || 'sk-none' }]
 }, null, 2);
 document.getElementById('apiBtn').onclick = () => {

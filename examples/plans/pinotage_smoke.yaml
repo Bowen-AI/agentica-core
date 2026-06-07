@@ -1,0 +1,16 @@
+# Minimal real SSH-box smoke task: prove the full submit -> rsync code -> on-node
+# Planner/Executor/Auditor -> deterministic backstop pipeline works on a plain GPU
+# box (pinotage, no SLURM) over the ~/.ssh/config alias.
+title: hello from pinotage
+kind: code
+goal: >
+  Use the write_file tool to create a file named hello.txt in the workspace whose
+  entire content is exactly the line: hello from pinotage
+workspace: ./ws_pinotage         # created fresh on the node if absent
+checklist:
+  - "hello.txt exists and contains exactly 'hello from pinotage'"
+success_criteria:
+  tests: "grep -qx 'hello from pinotage' hello.txt"
+  artifacts: ["hello.txt"]
+max_iterations: 2
+max_steps_per_iteration: 6

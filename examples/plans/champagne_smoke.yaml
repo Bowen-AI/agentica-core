@@ -1,0 +1,15 @@
+# Cold-box smoke: same pipeline as pinotage_smoke, but champagne starts with no
+# running ollama and no models — exercises the runner's auto serve + auto pull.
+title: hello from champagne
+kind: code
+goal: >
+  Use the write_file tool to create a file named hello.txt in the workspace whose
+  entire content is exactly the line: hello from champagne
+workspace: ./ws_champagne
+checklist:
+  - "hello.txt exists and contains exactly 'hello from champagne'"
+success_criteria:
+  tests: "grep -qx 'hello from champagne' hello.txt"
+  artifacts: ["hello.txt"]
+max_iterations: 2
+max_steps_per_iteration: 6

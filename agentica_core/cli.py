@@ -28,7 +28,7 @@ def main(argv=None) -> int:
     p_api.add_argument("--workspace", default="sample_workspace")
     p_api.add_argument("--db", default=".agentic/agentica.db")
     p_api.add_argument("--ollama-host", default="http://127.0.0.1:11434")
-    p_api.add_argument("--model", default="llama3.2:3b")
+    p_api.add_argument("--model", default="qwen3.5:4b-mlx")
 
     p_up = sub.add_parser("up", help="Bring up the interactive gateway.")
     p_up.add_argument("cluster", help="Path to cluster.yaml")

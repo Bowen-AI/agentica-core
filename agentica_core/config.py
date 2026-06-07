@@ -1,4 +1,4 @@
-"""YAML config + validation for slurm-open-agentic.
+"""YAML config + validation for agentica-core.
 
 Two schemas:
 
@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-DEFAULT_MODEL = "qwen3.6"  # popular default; see catalog.py preset library
+DEFAULT_MODEL = "qwen3.5:9b"  # real, benchmark-validated default; see catalog.py preset library
 DEFAULT_ENGINE = "ollama"
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_VLLM_PORT = 8000
@@ -196,6 +196,17 @@ class JobResources:
 class SuccessCriteria:
     tests: str | None = None  # shell command; exit code 0 required
     artifacts: list[str] = field(default_factory=list)
+    # --- hardening knobs (all optional, backward compatible) ---
+    # If set, the tests command must ALSO print this token to stdout to pass -- closes
+    # the "reduce the test to `print('OK')` / `sys.exit(0)`" exit-code-only gaming gap.
+    tests_success_token: str | None = None
+    # Seeded grader/fixture files (e.g. a spec-test) the agent must NOT alter. They are
+    # snapshotted in memory at job start and restored from that pristine copy before each
+    # backstop run, so the gate always executes against the original (tamper-evident).
+    protect: list[str] = field(default_factory=list)
+    # {path: [symbol, ...]} -> the artifact must DEFINE these top-level names (AST-checked),
+    # not merely exist -- closes the "empty/stub file satisfies the artifact gate" gap.
+    artifact_symbols: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -224,6 +235,12 @@ class PlanConfig:
         success = SuccessCriteria(
             tests=sc_raw.get("tests"),
             artifacts=list(sc_raw.get("artifacts") or []),
+            tests_success_token=sc_raw.get("tests_success_token"),
+            protect=[str(p) for p in (sc_raw.get("protect") or [])],
+            artifact_symbols={
+                str(k): [str(s) for s in (v or [])]
+                for k, v in (sc_raw.get("artifact_symbols") or {}).items()
+            },
         )
         return cls(
             title=str(data.get("title", data["goal"][:60])),

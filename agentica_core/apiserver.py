@@ -51,19 +51,40 @@ class State:
         self.db_path = db_path
         self._apps: dict[str, object] = {}          # workspace -> AgentServerApp (agentic chat)
         self.local_jobs: dict[str, dict] = {}        # local_id -> {status, outcome, ...}
+        self._model_resolved = False
+
+    def resolve_model(self) -> str:
+        """Effective model for inference. If the configured model isn't installed
+        but Ollama has others, fall back to a present one (preferring the same
+        family, then a qwen*, then the first installed) and memoize it -- so chat
+        and jobs work with whatever the user actually has instead of dead-ending
+        on a 404 'model not found'. When Ollama is down/empty we keep the
+        configured model untouched (the Setup flow guides the user to it)."""
+        if self._model_resolved:
+            return self.model
+        models = ollama_models(self.ollama_host)
+        if not models:
+            return self.model
+        if not model_present(self.model, models):
+            family = self.model.split(":")[0]
+            self.model = (next((m for m in models if m.split(":")[0] == family), None)
+                          or next((m for m in models if m.startswith("qwen")), None)
+                          or models[0])
+        self._model_resolved = True
+        return self.model
 
     def app_for(self, workspace: str | None):
         ws = workspace or self.workspace
         if ws not in self._apps:
             self._apps[ws] = gateway.build_app(
-                ollama_host=self.ollama_host, model_name=self.model,
+                ollama_host=self.ollama_host, model_name=self.resolve_model(),
                 workspace=ws, db_path=self.db_path, auth_token=None)
         return self._apps[ws]
 
     def complete(self, messages: list[dict], temperature: float = 0.2, timeout: float = 180) -> str:
         """Plain (non-agentic) chat completion via the engine's OpenAI /v1."""
         url = self.ollama_host + "/v1/chat/completions"
-        body = json.dumps({"model": self.model, "messages": messages,
+        body = json.dumps({"model": self.resolve_model(), "messages": messages,
                            "temperature": temperature, "stream": False}).encode()
         req = urllib.request.Request(url, data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
@@ -71,8 +92,9 @@ class State:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = json.loads(r.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"model unreachable at {self.ollama_host}: {getattr(exc, 'reason', exc)}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
+            raise RuntimeError(f"model unreachable at {self.ollama_host}: {reason}")
 
 
 # --------------------------------------------------------------------------- #
@@ -100,16 +122,22 @@ def workspace_summary(ws: str, max_files: int = 40, max_bytes: int = 1500) -> st
 def draft_plan(state: State, goal: str, workspace: str | None) -> dict:
     ctx = workspace_summary(workspace) if workspace else ""
     sys = ("You are a planning assistant. Given a goal, produce a concrete, ordered, checkable "
-           "plan. Reply STRICTLY as JSON: {\"title\": str, \"steps\": [str, ...], "
-           "\"tests\": str (a shell command that verifies success, or \"\"), "
+           "plan. The plan is carried out by an AUTONOMOUS agent that has file read/write and "
+           "shell tools -- NOT a human at a GUI. Steps must be concrete agent actions (write a "
+           "file, run a command); never 'open a text editor', 'save the file', or manual GUI steps. "
+           "Reply STRICTLY as JSON: {\"title\": str, \"steps\": [str, ...], "
+           "\"tests\": str (a shell command that genuinely verifies success via exit code -- e.g. "
+           "grep/diff/an assertion script, NOT a bare echo/print that always succeeds, or \"\"), "
            "\"artifacts\": [str, ...]}. Steps are short imperative lines. No prose outside JSON.")
     user = (f"Goal:\n{goal}\n\n" + (f"Workspace context:\n{ctx}\n\n" if ctx else "")
             + "Return the JSON plan.")
     raw = state.complete([{"role": "system", "content": sys}, {"role": "user", "content": user}])
     parsed = _extract_json(raw) or {}
     steps = parsed.get("steps") or _fallback_steps(raw)
+    # The model authored the tests string -> NOT a vetted gate (see _plan_payload).
     return _plan_payload(parsed.get("title") or goal[:60], goal, steps,
-                         parsed.get("tests", ""), parsed.get("artifacts", []))
+                         parsed.get("tests", ""), parsed.get("artifacts", []),
+                         tests_authoritative=False)
 
 
 def refine_plan(state: State, plan: dict, comments: list[dict]) -> dict:
@@ -128,14 +156,36 @@ def refine_plan(state: State, plan: dict, comments: list[dict]) -> dict:
     new_steps = parsed.get("steps") or steps
     return _plan_payload(parsed.get("title") or plan.get("title", ""), plan.get("goal", ""),
                          new_steps, parsed.get("tests", plan.get("tests", "")),
-                         parsed.get("artifacts", plan.get("artifacts", [])))
+                         parsed.get("artifacts", plan.get("artifacts", [])),
+                         tests_authoritative=False)
 
 
-def _plan_payload(title, goal, steps, tests, artifacts) -> dict:
+# Shell fragments that indicate a test actually *verifies* something (can fail on bad work).
+_VERIFY_TOKENS = ("test ", "[ ", "[[", "grep", "diff", "cmp", "assert", "pytest",
+                  "unittest", "python", "node", "exit 1", "|| exit", "return 1")
+
+
+def _test_is_trivial(cmd: str) -> bool:
+    """A model-drafted 'tests' string that cannot meaningfully fail (e.g. `true`, a bare
+    `echo ok`) would rubber-stamp wrong work if used as the gate -- treat it as no test."""
+    c = (cmd or "").strip()
+    if not c or c in ("true", ":", "exit 0", "/bin/true"):
+        return True
+    return not any(tok in c.lower() for tok in _VERIFY_TOKENS)
+
+
+def _plan_payload(title, goal, steps, tests, artifacts, *, tests_authoritative: bool = True) -> dict:
+    test_cmd = (tests or "").strip()
+    # Drop an obviously vacuous model-drafted test so it can't masquerade as a real gate.
+    if test_cmd and not tests_authoritative and _test_is_trivial(test_cmd):
+        test_cmd = ""
     return {
         "title": title, "goal": goal,
         "lines": [{"id": f"L{i+1}", "text": str(s)} for i, s in enumerate(steps) if str(s).strip()],
-        "tests": tests or "",
+        "tests": test_cmd,
+        # Whether the tests command is a vetted gate. Model-drafted tests are NOT vetted;
+        # the UI should let the user review/replace them before relying on the auto-pass.
+        "tests_authoritative": bool(tests_authoritative and test_cmd),
         "artifacts": list(artifacts or []),
     }
 
@@ -198,7 +248,7 @@ def submit_local(state: State, plan: dict, workspace: str) -> dict:
             rec["log"].append(msg)
         try:
             outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
-                              provider="ollama", model_name=state.model,
+                              provider="ollama", model_name=state.resolve_model(),
                               ollama_host=state.ollama_host, model_timeout=300, _print=note)
             rec["outcome"] = outcome.to_dict()
             rec["status"] = "passed" if outcome.passed else "failed"
@@ -443,7 +493,7 @@ def make_handler(state: State):
                     msgs.append({"role": "user", "content": message})
                     req = urllib.request.Request(
                         state.ollama_host.rstrip("/") + "/v1/chat/completions",
-                        data=json.dumps({"model": state.model, "messages": msgs, "stream": True}).encode(),
+                        data=json.dumps({"model": state.resolve_model(), "messages": msgs, "stream": True}).encode(),
                         headers={"Content-Type": "application/json"}, method="POST")
                     with urllib.request.urlopen(req, timeout=600) as resp:
                         for raw in resp:
@@ -590,7 +640,7 @@ def make_handler(state: State):
 
 def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str = "sample_workspace",
           db_path: str = ".agentic/agentica.db", ollama_host: str = "http://127.0.0.1:11434",
-          model: str = "llama3.2:3b") -> int:
+          model: str = "qwen3.5:4b-mlx") -> int:
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")

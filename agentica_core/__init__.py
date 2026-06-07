@@ -1,4 +1,4 @@
-"""slurm-open-agentic: open-weight agentic AI on a SLURM cluster.
+"""agentica-core: open-weight agentic AI on a SLURM cluster.
 
 Two modes, both built on AgenticLocal's ``agentic_loop`` engine:
 

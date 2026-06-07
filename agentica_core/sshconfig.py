@@ -1,7 +1,7 @@
 """Read the user's ~/.ssh/config so the project can target ANY host defined there.
 
 The user picks a server by its ssh alias; OpenSSH already knows the HostName, User,
-Port, IdentityFile and ProxyJump (hops) for it, so slurm-open-agentic just runs
+Port, IdentityFile and ProxyJump (hops) for it, so agentica-core just runs
 ``ssh <alias>`` and inherits all of that. ``list_hosts`` powers `slurm-agentic hosts`;
 ``resolve`` uses ``ssh -G`` for the fully-resolved effective config of one alias.
 """

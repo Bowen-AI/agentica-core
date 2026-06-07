@@ -48,7 +48,7 @@ def make_gateway_handler(
     """Build a request handler that delegates to ``app`` and adds /v1 + auth + chat UI."""
 
     class GatewayHandler(BaseHTTPRequestHandler):
-        server_version = f"slurm-open-agentic/{__version__}"
+        server_version = f"agentica-core/{__version__}"
 
         def log_message(self, *args):  # quiet
             return
@@ -216,8 +216,8 @@ def make_gateway_handler(
 
 def _openai_models(model_label: str) -> dict:
     return {"object": "list", "data": [
-        {"id": model_label, "object": "model", "owned_by": "slurm-open-agentic"},
-        {"id": "agentic", "object": "model", "owned_by": "slurm-open-agentic"},
+        {"id": model_label, "object": "model", "owned_by": "agentica-core"},
+        {"id": "agentic", "object": "model", "owned_by": "agentica-core"},
     ]}
 
 
