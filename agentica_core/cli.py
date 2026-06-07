@@ -25,8 +25,9 @@ def main(argv=None) -> int:
     p_api = sub.add_parser("serve-api", help="Start the JSON API for the Agentica UI.")
     p_api.add_argument("--host", default="127.0.0.1")
     p_api.add_argument("--port", type=int, default=8770)
-    p_api.add_argument("--workspace", default="sample_workspace")
-    p_api.add_argument("--db", default=".agentic/agentica.db")
+    # default None -> serve() resolves to a writable dir ($AGENTICA_DATA_DIR or ~/.local/...)
+    p_api.add_argument("--workspace", default=None)
+    p_api.add_argument("--db", default=None)
     p_api.add_argument("--ollama-host", default="http://127.0.0.1:11434")
     p_api.add_argument("--model", default="qwen3.5:4b-mlx")
     p_api.add_argument("--clusters-dir", default=None,

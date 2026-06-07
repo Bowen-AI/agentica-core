@@ -607,31 +607,14 @@ def make_handler(state: State):
                         if ctx:
                             msgs.append({"role": "system", "content": "Workspace context:\n" + ctx})
                     msgs.append({"role": "user", "content": message})
-                    req = urllib.request.Request(
-                        state.ollama_host.rstrip("/") + "/v1/chat/completions",
-                        data=json.dumps({"model": state.resolve_model(), "messages": msgs, "stream": True}).encode(),
-                        headers={"Content-Type": "application/json"}, method="POST")
-                    with urllib.request.urlopen(req, timeout=600) as resp:
-                        for raw in resp:
-                            line = raw.decode("utf-8", "replace").strip()
-                            if not line.startswith("data: "):
-                                continue
-                            data = line[6:]
-                            if data == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-                            d = (chunk.get("choices") or [{}])[0].get("delta", {})
-                            # Reasoning models (e.g. qwen3.5) stream a long `reasoning`
-                            # trace with empty `content` while thinking -- forward it as a
-                            # distinct event so the UI shows live "thinking" instead of a
-                            # frozen empty bubble, then stream the answer as `content` lands.
-                            if d.get("reasoning"):
-                                self._sse({"reasoning": d["reasoning"]})
-                            if d.get("content"):
-                                self._sse({"delta": d["content"]})
+                    # think=False -> direct, fast answers (the reasoning model otherwise
+                    # streams a long chain-of-thought before any content, on even trivial
+                    # prompts). Reasoning is still forwarded if a model emits it.
+                    state.complete_stream(
+                        msgs,
+                        on_reasoning=lambda t: self._safe_sse({"reasoning": t}),
+                        on_content=lambda t: self._safe_sse({"delta": t}),
+                        think=False)
                     self._sse({"done": True})
                 else:
                     app = state.app_for(ws)
@@ -798,9 +781,20 @@ def make_handler(state: State):
     return H
 
 
-def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str = "sample_workspace",
-          db_path: str = ".agentic/agentica.db", ollama_host: str = "http://127.0.0.1:11434",
+def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = None,
+          db_path: str | None = None, ollama_host: str = "http://127.0.0.1:11434",
           model: str = "qwen3.5:4b-mlx", clusters_dir: str | None = None) -> int:
+    # The desktop app launches us with CWD=/ (read-only), so resolve data paths to a
+    # WRITABLE absolute dir (the app passes AGENTICA_DATA_DIR; fall back to ~/.local).
+    # Relative defaults like ".agentic" would otherwise fail with EROFS on every chat.
+    data_dir = os.environ.get("AGENTICA_DATA_DIR") or os.path.expanduser("~/.local/share/agentica")
+    workspace = workspace or os.path.join(data_dir, "workspace")
+    db_path = db_path or os.path.join(data_dir, "agentica.db")
+    try:
+        os.makedirs(workspace, exist_ok=True)
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    except OSError as exc:  # noqa: BLE001
+        print(f"warning: could not create data dir {data_dir}: {exc}")
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
                   clusters_dir=clusters_dir)
     server = ThreadingHTTPServer((host, port), make_handler(state))
