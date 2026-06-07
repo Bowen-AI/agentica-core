@@ -66,6 +66,26 @@ def test_plan_to_yaml_roundtrips_into_planconfig(tmp_path):
     assert pc.success_criteria.artifacts == ["x.txt"]
 
 
+def test_plan_to_yaml_can_pin_selected_model(tmp_path):
+    plan = apiserver._plan_payload("My Job", "achieve X", ["a"], "", [])
+    y = apiserver.plan_to_yaml(plan, str(tmp_path), model="Qwen/Qwen3-32B", engine="vllm")
+    p = tmp_path / "plan.yaml"
+    p.write_text(y)
+    pc = PlanConfig.load(p)
+    assert pc.model is not None
+    assert pc.model.engine == "vllm"
+    assert pc.model.name == "Qwen/Qwen3-32B"
+
+
+def test_runtime_preamble_describes_remote_inference():
+    text = apiserver._runtime_preamble(
+        "/ws", target="pinotage.usc.edu", model="llama3.2:3b", engine="ollama"
+    )
+    assert "Model inference target: pinotage.usc.edu using llama3.2:3b via ollama" in text
+    assert "chat tools run on the local" in text
+    assert "- You are running locally" not in text
+
+
 def test_workspace_summary_lists_files(tmp_path):
     (tmp_path / "a.txt").write_text("hello")
     (tmp_path / "sub").mkdir()
@@ -94,3 +114,30 @@ def test_load_clusters_and_cluster_path_mapping(tmp_path):
     assert st.cluster_path("disco") == str(tmp_path / "disco.yaml")   # cluster -> yaml path
     assert st.cluster_path("pinotage.usc.edu") == "pinotage.usc.edu"  # bare alias passthrough
     assert st.cluster_path("local") == "local"
+
+
+def test_model_catalog_uses_matching_cluster_host(tmp_path):
+    (tmp_path / "pinotage.yaml").write_text(
+        "\n".join([
+            "name: pinotage",
+            "ssh:",
+            "  host: pinotage.usc.edu",
+            "scheduler: ssh",
+            "model:",
+            "  engine: ollama",
+            "  name: llama3.2:3b",
+            "slurm:",
+            "  gpu_type: l40s",
+            "  gpu_count: 1",
+            "",
+        ])
+    )
+    st = apiserver.State(ollama_host="http://h", model="qwen3.5:4b-mlx", workspace="w",
+                         db_path="/tmp/agentica-models.db", clusters_dir=str(tmp_path))
+    assert st.cluster_path("pinotage.usc.edu") == str(tmp_path / "pinotage.yaml")
+    cat = apiserver.model_catalog_for_target(st, "pinotage.usc.edu")
+    assert cat["selected_model"] == "llama3.2:3b"
+    assert cat["selected_engine"] == "ollama"
+    ids = {o["id"] for o in cat["options"]}
+    assert "llama3.2:3b" in ids
+    assert "qwen3.5:4b-mlx" not in ids

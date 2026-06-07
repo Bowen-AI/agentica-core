@@ -23,6 +23,7 @@ import datetime
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -30,13 +31,16 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import gateway, job, sshconfig
-from .config import ClusterConfig, PlanConfig, SuccessCriteria
+from . import catalog, gateway, job, serving, sshconfig
+from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, ModelConfig,
+                     PlanConfig, SuccessCriteria)
 from .on_node_runner import run_job
+from .transport import Transport
 
 __version__ = "0.1.0"
 
@@ -46,24 +50,40 @@ __version__ = "0.1.0"
 # cutoff and no idea of "now" / where they run -- give them a live preamble).
 # --------------------------------------------------------------------------- #
 AGENTICA_SYSTEM_PROMPT = (
-    "You are Agentica, a helpful AI assistant running locally on the user's own computer. "
+    "You are Agentica, a helpful AI assistant for the user's Agentica workspace. "
     "Answer directly, or use your tools (read/write files, run shell commands, search the web) "
     "to get things done in the workspace -- the runtime executes tools and enforces policy. "
     "Be concise and accurate; if you don't know something, say so instead of guessing."
 )
 
 
-def _runtime_preamble(workspace: str | None = None) -> str:
+def _runtime_preamble(
+    workspace: str | None = None,
+    *,
+    target: str | None = None,
+    model: str | None = None,
+    engine: str | None = None,
+) -> str:
     """Live context for the model -- authoritative for any date/time/'today'/'now'
     question (the model's own training data is stale)."""
     now = datetime.datetime.now().astimezone()
     osname = "macOS" if os.uname().sysname == "Darwin" else os.uname().sysname
+    t = (target or "local").strip() or "local"
+    m = f" using {model}" if model else ""
+    e = f" via {engine}" if engine else ""
     lines = [
         "Live context (authoritative -- your training data is stale, prefer THIS for any "
         "date, time, 'today', 'now', or 'current' question):",
         f"- Current date & time: {now:%A, %B %-d, %Y at %-I:%M %p} {now.tzname() or ''}".rstrip(),
-        f"- You are running locally on {osname} ({os.uname().machine}).",
     ]
+    if t == "local":
+        lines.append(f"- Model inference target: local on {osname} ({os.uname().machine}){m}{e}.")
+    else:
+        lines.append(f"- Model inference target: {t}{m}{e}.")
+        lines.append(
+            f"- Agentica's UI/backend and chat tools run on the local {osname} "
+            f"({os.uname().machine}); submitted jobs run on the selected target."
+        )
     if workspace:
         lines.append(f"- Working directory: {workspace}")
     return "\n".join(lines)
@@ -87,13 +107,40 @@ def load_clusters(clusters_dir: str | None) -> dict[str, dict]:
             cfg = ClusterConfig.load(f)
         except Exception:  # noqa: BLE001 - skip non-cluster yaml / unreadable files
             continue
-        out[cfg.name] = {"path": str(f), "host": cfg.ssh.host, "scheduler": cfg.scheduler}
+        out[cfg.name] = {
+            "path": str(f),
+            "host": cfg.ssh.host,
+            "scheduler": cfg.scheduler,
+            "model": cfg.model.name,
+            "engine": cfg.model.engine,
+            "gpu_type": cfg.slurm.gpu_type,
+            "gpu_count": cfg.slurm.gpu_count,
+        }
     return out
 
 
 # --------------------------------------------------------------------------- #
 # in-memory state
 # --------------------------------------------------------------------------- #
+@dataclass
+class RuntimeBinding:
+    target: str
+    model: str
+    engine: str
+    base_url: str
+    tunnel_cm: object | None = None
+    tunnel: object | None = None
+    job_id: str | None = None
+
+    @property
+    def api_base(self) -> str:
+        return self.base_url.rstrip("/") + "/v1"
+
+    def alive(self) -> bool:
+        tun = self.tunnel
+        return bool(tun is None or getattr(tun, "alive")())
+
+
 class State:
     def __init__(self, *, ollama_host: str, model: str, workspace: str, db_path: str,
                  clusters_dir: str | None = None):
@@ -101,7 +148,9 @@ class State:
         self.model = model
         self.workspace = workspace
         self.db_path = db_path
-        self._apps: dict[str, object] = {}          # workspace -> AgentServerApp (agentic chat)
+        self._apps: dict[tuple, object] = {}        # runtime/workspace -> AgentServerApp
+        self._runtimes: dict[tuple[str, str, str], RuntimeBinding] = {}
+        self._runtime_lock = threading.Lock()
         self.local_jobs: dict[str, dict] = {}        # local_id -> {status, outcome, ...}
         self._model_resolved = False
         self.clusters = load_clusters(clusters_dir)  # name -> {path, host, scheduler}
@@ -110,15 +159,37 @@ class State:
         """Map a target name to its cluster.yaml path if it's a known cluster, else
         return the target unchanged (a bare ~/.ssh/config alias, or 'local')."""
         c = self.clusters.get(target)
-        return c["path"] if c else target
+        if c:
+            return c["path"]
+        # The UI may expose an SSH-config alias (e.g. "pinotage.usc.edu") while a
+        # cluster YAML uses a friendlier name ("pinotage"). Treat matching hosts as
+        # the configured cluster so chat/jobs inherit its model and scheduler knobs.
+        for cfg in self.clusters.values():
+            if target and target == cfg.get("host"):
+                return cfg["path"]
+        return target
 
-    def resolve_model(self) -> str:
+    def target_cluster(self, target: str | None) -> ClusterConfig | None:
+        t = (target or "local").strip() or "local"
+        if t == "local":
+            return None
+        return ClusterConfig.resolve(self.cluster_path(t))
+
+    def default_model_for_target(self, target: str | None) -> str:
+        cluster = self.target_cluster(target)
+        if cluster:
+            return cluster.model.name
+        return self.resolve_model()
+
+    def resolve_model(self, model: str | None = None) -> str:
         """Effective model for inference. If the configured model isn't installed
         but Ollama has others, fall back to a present one (preferring the same
         family, then a qwen*, then the first installed) and memoize it -- so chat
         and jobs work with whatever the user actually has instead of dead-ending
         on a 404 'model not found'. When Ollama is down/empty we keep the
         configured model untouched (the Setup flow guides the user to it)."""
+        if model:
+            return model
         if self._model_resolved:
             return self.model
         models = ollama_models(self.ollama_host)
@@ -132,22 +203,85 @@ class State:
         self._model_resolved = True
         return self.model
 
-    def app_for(self, workspace: str | None):
+    def _engine_for(self, target: str, model: str, engine: str | None) -> str:
+        if engine in {"ollama", "vllm"}:
+            return engine
+        cluster = self.target_cluster(target)
+        if cluster and model == cluster.model.name:
+            return cluster.model.engine
+        return "vllm" if "/" in model else "ollama"
+
+    def runtime_for(self, target: str | None = None, model: str | None = None,
+                    engine: str | None = None, notify=None) -> RuntimeBinding:
+        t = (target or "local").strip() or "local"
+        selected_model = model or self.default_model_for_target(t)
+        selected_engine = self._engine_for(t, selected_model, engine)
+        if t == "local":
+            if selected_engine != "ollama":
+                raise RuntimeError("local chat currently supports Ollama models only")
+            return RuntimeBinding(t, self.resolve_model(selected_model), "ollama", self.ollama_host)
+
+        key = (t, selected_model, selected_engine)
+        with self._runtime_lock:
+            cached = self._runtimes.get(key)
+            if cached and cached.alive():
+                return cached
+            if notify:
+                notify(f"Starting {selected_engine} model {selected_model} on {t}...")
+            cluster = self.target_cluster(t) or ClusterConfig.resolve(t)
+            model_cfg = _model_config_for_selection(cluster.model, selected_model, selected_engine)
+            fit = serving.preflight(cluster, model_cfg)
+            if fit.verdict == "won't fit":
+                raise RuntimeError(f"model {selected_model} will not fit on {t}: {fit.message}")
+            transport = Transport.from_cluster(cluster)
+            remote_jobdir = transport.expand_home(
+                f"{cluster.remote_workdir}/chat-{uuid.uuid4().hex[:8]}"
+            )
+            handle = serving.bring_up(
+                transport, cluster, remote_jobdir, model=model_cfg,
+                wait_timeout_s=max(60.0, model_cfg.timeout_s),
+            )
+            local_port = _free_port()
+            readiness = f"http://127.0.0.1:{local_port}{serving.readiness_path(handle.engine)}"
+            if notify:
+                notify(f"Opening tunnel to {handle.node}:{handle.port}...")
+            cm = transport.tunnel(
+                local_port, handle.node, handle.port,
+                readiness_url=readiness, readiness_timeout_s=max(60.0, model_cfg.timeout_s),
+            )
+            tunnel = cm.__enter__()
+            runtime = RuntimeBinding(
+                target=t, model=selected_model, engine=selected_engine,
+                base_url=tunnel.base_url, tunnel_cm=cm, tunnel=tunnel, job_id=handle.job_id,
+            )
+            self._runtimes[key] = runtime
+            return runtime
+
+    def app_for(self, workspace: str | None, target: str | None = None,
+                model: str | None = None, engine: str | None = None, notify=None):
         ws = workspace or self.workspace
+        rt = self.runtime_for(target, model, engine, notify=notify)
         # Key by date too, so a long-running backend rebuilds with a fresh "today" in
         # the system preamble (the AgentServerApp caches its controller/system prompt).
-        key = (ws, datetime.date.today().isoformat())
+        key = (ws, datetime.date.today().isoformat(), rt.target, rt.model, rt.engine, rt.base_url)
         if key not in self._apps:
+            provider = "ollama" if rt.engine == "ollama" else "openai-compatible"
             self._apps[key] = gateway.build_app(
-                ollama_host=self.ollama_host, model_name=self.resolve_model(),
+                ollama_host=rt.base_url, model_name=rt.model,
                 workspace=ws, db_path=self.db_path, auth_token=None,
-                system_prompt=AGENTICA_SYSTEM_PROMPT + "\n\n" + _runtime_preamble(ws))
+                provider=provider, api_base=rt.api_base,
+                system_prompt=AGENTICA_SYSTEM_PROMPT + "\n\n" + _runtime_preamble(
+                    ws, target=rt.target, model=rt.model, engine=rt.engine,
+                ))
         return self._apps[key]
 
-    def complete(self, messages: list[dict], temperature: float = 0.2, timeout: float = 180) -> str:
+    def complete(self, messages: list[dict], temperature: float = 0.2, timeout: float = 180,
+                 target: str | None = None, model: str | None = None,
+                 engine: str | None = None) -> str:
         """Plain (non-agentic) chat completion via the engine's OpenAI /v1."""
-        url = self.ollama_host + "/v1/chat/completions"
-        body = json.dumps({"model": self.resolve_model(), "messages": messages,
+        rt = self.runtime_for(target, model, engine)
+        url = rt.api_base + "/chat/completions"
+        body = json.dumps({"model": rt.model, "messages": messages,
                            "temperature": temperature, "stream": False}).encode()
         req = urllib.request.Request(url, data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
@@ -157,11 +291,13 @@ class State:
             return data["choices"][0]["message"]["content"]
         except (urllib.error.URLError, TimeoutError) as exc:
             reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
-            raise RuntimeError(f"model unreachable at {self.ollama_host}: {reason}")
+            raise RuntimeError(f"model unreachable at {rt.base_url}: {reason}")
 
     def complete_stream(self, messages: list[dict], on_reasoning=None, on_content=None,
                         think: bool = True, fmt: str | None = None,
-                        temperature: float = 0.2, timeout: float = 600) -> str:
+                        temperature: float = 0.2, timeout: float = 600,
+                        target: str | None = None, model: str | None = None,
+                        engine: str | None = None, on_status=None) -> str:
         """Streaming completion via Ollama's native /api/chat. Calls
         on_reasoning(text)/on_content(text) per delta and returns the full content.
 
@@ -169,8 +305,14 @@ class State:
         planner uses this so a simple plan returns in seconds instead of after a
         minute-plus of reasoning. `fmt="json"` constrains output to valid JSON
         (so plan parsing can't fail on malformed model output)."""
-        url = self.ollama_host + "/api/chat"
-        payload: dict = {"model": self.resolve_model(), "messages": messages,
+        rt = self.runtime_for(target, model, engine, notify=on_status)
+        if rt.engine != "ollama":
+            return self._complete_stream_openai(
+                rt, messages, on_content=on_content, fmt=fmt,
+                temperature=temperature, timeout=timeout,
+            )
+        url = rt.base_url + "/api/chat"
+        payload: dict = {"model": rt.model, "messages": messages,
                          "think": think, "stream": True, "options": {"temperature": temperature}}
         if fmt:
             payload["format"] = fmt
@@ -198,8 +340,187 @@ class State:
                         break
         except (urllib.error.URLError, TimeoutError) as exc:
             reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
-            raise RuntimeError(f"model unreachable at {self.ollama_host}: {reason}")
+            raise RuntimeError(f"model unreachable at {rt.base_url}: {reason}")
         return "".join(content)
+
+    def _complete_stream_openai(self, rt: RuntimeBinding, messages: list[dict], *,
+                                on_content=None, fmt: str | None = None,
+                                temperature: float = 0.2, timeout: float = 600) -> str:
+        url = rt.api_base + "/chat/completions"
+        payload: dict = {"model": rt.model, "messages": messages,
+                         "temperature": temperature, "stream": True}
+        if fmt == "json":
+            payload["response_format"] = {"type": "json_object"}
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        content: list[str] = []
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        text = delta.get("content")
+                        if text:
+                            content.append(text)
+                            if on_content:
+                                on_content(text)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
+            raise RuntimeError(f"model unreachable at {rt.base_url}: {reason}")
+        return "".join(content)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _model_config_for_selection(base: ModelConfig, model: str, engine: str) -> ModelConfig:
+    if engine == "ollama":
+        port = base.serve_port if base.engine == "ollama" else DEFAULT_OLLAMA_PORT
+    else:
+        port = base.serve_port if base.engine == "vllm" else DEFAULT_VLLM_PORT
+    return replace(base, engine=engine, name=model, serve_port=port)
+
+
+def _checkpoint_for_engine(model_key: str, engine: str) -> tuple[str | None, str]:
+    spec = catalog.get_model(model_key)
+    checkpoints = spec.checkpoints if spec else ()
+    if engine == "ollama":
+        for ckpt in checkpoints:
+            if ckpt.lower().startswith("ollama:"):
+                return ckpt.split(":", 1)[1].strip(), "ollama"
+        return None, "ollama"
+    for ckpt in checkpoints:
+        if ckpt.lower().startswith("ollama:"):
+            continue
+        if "/" in ckpt and "community" not in ckpt.lower() and "verify" not in ckpt.lower():
+            return ckpt.strip(), "huggingface"
+    return model_key, "huggingface"
+
+
+def _catalog_label(model_key: str, model_id: str) -> str:
+    spec = catalog.get_model(model_key)
+    return spec.display if spec else model_id
+
+
+def _add_model_option(options: list[dict], seen: set[tuple[str, str]], *,
+                      model_id: str, engine: str, label: str | None = None,
+                      source: str = "ollama", catalog_key: str | None = None,
+                      installed: bool = False, recommended: bool = False,
+                      configured: bool = False, fit: str | None = None,
+                      note: str = "") -> None:
+    key = (model_id, engine)
+    if key in seen:
+        for opt in options:
+            if (opt["id"], opt["engine"]) == key:
+                opt["installed"] = bool(opt.get("installed") or installed)
+                opt["recommended"] = bool(opt.get("recommended") or recommended)
+                opt["configured"] = bool(opt.get("configured") or configured)
+                if note and note not in opt.get("note", ""):
+                    opt["note"] = (opt.get("note", "") + " " + note).strip()
+                return
+    seen.add(key)
+    options.append({
+        "id": model_id,
+        "label": label or model_id,
+        "engine": engine,
+        "source": source,
+        "catalog_key": catalog_key,
+        "installed": installed,
+        "recommended": recommended,
+        "configured": configured,
+        "fit": fit,
+        "note": note,
+    })
+
+
+def model_catalog_for_target(state: State, target: str | None) -> dict:
+    t = (target or "local").strip() or "local"
+    options: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    warning = ""
+
+    if t == "local":
+        installed = ollama_models(state.ollama_host)
+        selected = state.resolve_model()
+        for name in installed:
+            _add_model_option(options, seen, model_id=name, engine="ollama",
+                              source="ollama", installed=True,
+                              recommended=name == selected, fit="installed locally")
+        for key in ("qwen3.5-9b", "gemma4-e4b", "gemma4-e2b", "llama3.2-3b"):
+            model_id, source = _checkpoint_for_engine(key, "ollama")
+            if model_id:
+                _add_model_option(
+                    options, seen, model_id=model_id, engine="ollama",
+                    label=_catalog_label(key, model_id), source=source,
+                    catalog_key=key, fit="small local Ollama option",
+                    note="Pulls from Ollama if not installed.",
+                )
+        if selected and (selected, "ollama") not in seen:
+            _add_model_option(options, seen, model_id=selected, engine="ollama",
+                              source="ollama", configured=True)
+        return {"target": t, "selected_model": selected, "selected_engine": "ollama",
+                "options": options, "warning": warning}
+
+    cluster = state.target_cluster(t)
+    assert cluster is not None
+    selected = cluster.model.name
+    selected_engine = cluster.model.engine
+    _add_model_option(options, seen, model_id=selected, engine=selected_engine,
+                      label=f"{selected} (target default)",
+                      source="ollama" if selected_engine == "ollama" else "huggingface",
+                      configured=True, recommended=True, fit="configured for this target")
+
+    gpu_types = []
+    if cluster.slurm.gpu_type and cluster.slurm.gpu_type != "any":
+        gpu_types.append(cluster.slurm.gpu_type)
+    gpu_types.extend(g for g in cluster.resources.gpu_types if g not in gpu_types)
+    for gpu in gpu_types:
+        try:
+            presets = catalog.presets_for_gpu(gpu, cluster.slurm.gpu_count)
+        except KeyError:
+            continue
+        rec = catalog.recommend(gpu, cluster.slurm.gpu_count)
+        for p in presets:
+            spec = catalog.get_model(p.model)
+            if not spec or spec.kind != "llm" or p.engine not in {"ollama", "vllm"}:
+                continue
+            model_id, source = _checkpoint_for_engine(p.model, p.engine)
+            if not model_id:
+                continue
+            _add_model_option(
+                options, seen, model_id=model_id, engine=p.engine,
+                label=_catalog_label(p.model, model_id), source=source,
+                catalog_key=p.model,
+                recommended=bool(rec and rec.name == p.name),
+                fit=f"{p.gpu_count}x {p.gpu} · {p.quant}",
+                note=p.note or "Catalog preset that fits this target profile.",
+            )
+    if not gpu_types:
+        warning = "No GPU profile for this target yet; showing target default plus small Ollama-safe options."
+        for key in ("llama3.2-3b", "qwen3.5-9b", "gemma4-e4b"):
+            model_id, source = _checkpoint_for_engine(key, "ollama")
+            if model_id:
+                _add_model_option(
+                    options, seen, model_id=model_id, engine="ollama",
+                    label=_catalog_label(key, model_id), source=source,
+                    catalog_key=key, fit="unchecked target fit",
+                    note="Run discovery or add a cluster YAML GPU type for exact fit filtering.",
+                )
+    return {"target": t, "selected_model": selected, "selected_engine": selected_engine,
+            "options": options, "warning": warning}
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +545,9 @@ def workspace_summary(ws: str, max_files: int = 40, max_bytes: int = 1500) -> st
     return "\n".join(lines)
 
 
-def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None) -> dict:
+def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None,
+               target: str | None = None, model: str | None = None,
+               engine: str | None = None) -> dict:
     ctx = workspace_summary(workspace) if workspace else ""
     sys = ("You are a planning assistant. Given a goal, produce a concrete, ordered, checkable "
            "plan. The plan is carried out by an AUTONOMOUS agent that has file read/write and "
@@ -234,12 +557,16 @@ def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None
            "\"tests\": str (a shell command that genuinely verifies success via exit code -- e.g. "
            "grep/diff/an assertion script, NOT a bare echo/print that always succeeds, or \"\"), "
            "\"artifacts\": [str, ...]}. Steps are short imperative lines. No prose outside JSON.")
-    user = (_runtime_preamble(workspace) + "\n\n" + f"Goal:\n{goal}\n\n"
+    user = (_runtime_preamble(workspace, target=target, model=model, engine=engine)
+            + "\n\n" + f"Goal:\n{goal}\n\n"
             + (f"Workspace context:\n{ctx}\n\n" if ctx else "") + "Return the JSON plan.")
     msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
     # Planning is a simple structured task -> disable chain-of-thought (fast: seconds, not
     # minutes) and force valid JSON so parsing can't fail.
-    raw = state.complete_stream(msgs, on_reasoning, think=False, fmt="json")
+    raw = state.complete_stream(
+        msgs, on_reasoning, think=False, fmt="json",
+        target=target, model=model, engine=engine,
+    )
     parsed = _extract_json(raw) or {}
     steps = parsed.get("steps") or _fallback_steps(raw)
     # The model authored the tests string -> NOT a vetted gate (see _plan_payload).
@@ -248,7 +575,9 @@ def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None
                          tests_authoritative=False)
 
 
-def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=None) -> dict:
+def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=None,
+                target: str | None = None, model: str | None = None,
+                engine: str | None = None) -> dict:
     steps = [ln["text"] for ln in plan.get("lines", [])]
     rendered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
     cmts = "\n".join(
@@ -260,7 +589,10 @@ def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=Non
             f"Tests: {plan.get('tests', '')}\nArtifacts: {plan.get('artifacts', [])}\n\n"
             f"User comments:\n{cmts}\n\nReturn the revised JSON plan.")
     msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
-    raw = state.complete_stream(msgs, on_reasoning, think=False, fmt="json")
+    raw = state.complete_stream(
+        msgs, on_reasoning, think=False, fmt="json",
+        target=target, model=model, engine=engine,
+    )
     parsed = _extract_json(raw) or {}
     new_steps = parsed.get("steps") or steps
     return _plan_payload(parsed.get("title") or plan.get("title", ""), plan.get("goal", ""),
@@ -322,7 +654,8 @@ def _fallback_steps(text: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # jobs
 # --------------------------------------------------------------------------- #
-def plan_to_yaml(plan: dict, workspace: str) -> str:
+def plan_to_yaml(plan: dict, workspace: str, model: str | None = None,
+                 engine: str | None = None) -> str:
     import yaml
     doc = {
         "title": plan.get("title", "agentica job"),
@@ -334,10 +667,14 @@ def plan_to_yaml(plan: dict, workspace: str) -> str:
         "max_iterations": 3,
         "max_steps_per_iteration": 12,
     }
+    if model:
+        doc["model"] = {"engine": engine or ("vllm" if "/" in model else "ollama"),
+                        "name": model}
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-def submit_local(state: State, plan: dict, workspace: str) -> dict:
+def submit_local(state: State, plan: dict, workspace: str, model: str | None = None,
+                 engine: str | None = None) -> dict:
     """Run the agentic job in a background thread against local ollama."""
     local_id = "local-" + uuid.uuid4().hex[:8]
     ws = workspace or tempfile.mkdtemp(prefix="agentica-job-")
@@ -356,8 +693,12 @@ def submit_local(state: State, plan: dict, workspace: str) -> dict:
         def note(msg):
             rec["log"].append(msg)
         try:
+            selected_model = model or state.resolve_model()
+            selected_engine = engine or ("vllm" if "/" in selected_model else "ollama")
+            if selected_engine != "ollama":
+                raise RuntimeError("local jobs currently support Ollama models only")
             outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
-                              provider="ollama", model_name=state.resolve_model(),
+                              provider="ollama", model_name=selected_model,
                               ollama_host=state.ollama_host, model_timeout=300, _print=note)
             rec["outcome"] = outcome.to_dict()
             rec["status"] = "passed" if outcome.passed else "failed"
@@ -369,13 +710,14 @@ def submit_local(state: State, plan: dict, workspace: str) -> dict:
     return {"local": True, "local_id": local_id, "target": "local", "workspace": ws}
 
 
-def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str) -> dict:
+def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str,
+                  model: str | None = None, engine: str | None = None) -> dict:
     """Write a plan.yaml and submit to a ssh/SLURM target via job.submit. ``target``
     is the display name shown/polled by the UI; ``cluster_path`` is the cluster.yaml
     (full SLURM config) or a bare ssh alias to actually connect with."""
     tmp = Path(tempfile.mkdtemp(prefix="agentica-plan-"))
     plan_path = tmp / "plan.yaml"
-    plan_path.write_text(plan_to_yaml(plan, workspace or "./workspace"), encoding="utf-8")
+    plan_path.write_text(plan_to_yaml(plan, workspace or "./workspace", model, engine), encoding="utf-8")
     captured: list[str] = []
     rc = job.submit(cluster_path, str(plan_path), sync_code=True, _print=captured.append)
     jobid = jobdir = None
@@ -632,9 +974,14 @@ def make_handler(state: State):
             message = (body.get("message") or "").strip()
             mode = body.get("mode", "agentic")
             ws = body.get("workspace")
+            target = body.get("target", "local")
+            model = body.get("model")
+            engine = body.get("engine")
             try:
                 if mode == "plain":
-                    msgs = [{"role": "system", "content": _runtime_preamble(ws)}]
+                    msgs = [{"role": "system", "content": _runtime_preamble(
+                        ws, target=target, model=model, engine=engine,
+                    )}]
                     if ws:
                         ctx = workspace_summary(ws)
                         if ctx:
@@ -647,10 +994,14 @@ def make_handler(state: State):
                         msgs,
                         on_reasoning=lambda t: self._safe_sse({"reasoning": t}),
                         on_content=lambda t: self._safe_sse({"delta": t}),
-                        think=False)
+                        think=False, target=target, model=model, engine=engine,
+                        on_status=lambda t: self._safe_sse({"status": t}))
                     self._sse({"done": True})
                 else:
-                    app = state.app_for(ws)
+                    app = state.app_for(
+                        ws, target=target, model=model, engine=engine,
+                        notify=lambda t: self._safe_sse({"status": t}),
+                    )
                     res = app.chat(message, body.get("session_id"))
                     self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
                                "session_id": res.get("session_id"), "done": True})
@@ -671,9 +1022,17 @@ def make_handler(state: State):
             on_r = lambda t: self._safe_sse({"reasoning": t})  # noqa: E731
             try:
                 if kind == "draft":
-                    plan = draft_plan(state, body.get("goal", ""), body.get("workspace"), on_reasoning=on_r)
+                    plan = draft_plan(
+                        state, body.get("goal", ""), body.get("workspace"), on_reasoning=on_r,
+                        target=body.get("target"), model=body.get("model"),
+                        engine=body.get("engine"),
+                    )
                 else:
-                    plan = refine_plan(state, body.get("plan", {}), body.get("comments", []), on_reasoning=on_r)
+                    plan = refine_plan(
+                        state, body.get("plan", {}), body.get("comments", []), on_reasoning=on_r,
+                        target=body.get("target"), model=body.get("model"),
+                        engine=body.get("engine"),
+                    )
                 self._sse({"plan": plan, "done": True})
             except Exception as exc:  # noqa: BLE001
                 self._safe_sse({"error": str(exc), "done": True})
@@ -688,6 +1047,10 @@ def make_handler(state: State):
                     return self._json(setup_status(state))
                 if u.path == "/api/model/pull":
                     return self._stream_pull((q.get("model") or [state.model])[0])
+                if u.path == "/api/models":
+                    return self._json(model_catalog_for_target(
+                        state, (q.get("target") or ["local"])[0],
+                    ))
                 if u.path == "/api/hosts":
                     hosts = [{"alias": "local", "hostname": "this machine", "user": "",
                               "proxy_jump": "", "kind": "local"}]
@@ -700,7 +1063,12 @@ def make_handler(state: State):
                 if u.path == "/api/history":
                     sid = (q.get("session_id") or [""])[0]
                     ws = (q.get("workspace") or [None])[0]
-                    app = state.app_for(ws)
+                    app = state.app_for(
+                        ws,
+                        target=(q.get("target") or ["local"])[0],
+                        model=(q.get("model") or [None])[0],
+                        engine=(q.get("engine") or [None])[0],
+                    )
                     msgs = app.storage.load_messages(sid) if sid else []
                     return self._json({"messages": [{"role": m.role, "content": m.content}
                                                     for m in msgs if m.role in ("user", "assistant")]})
@@ -726,11 +1094,19 @@ def make_handler(state: State):
                 if u.path == "/api/ollama/install":
                     return self._stream_install()
                 if u.path == "/api/plan/draft":
-                    return self._json(draft_plan(state, body.get("goal", ""), body.get("workspace")))
+                    return self._json(draft_plan(
+                        state, body.get("goal", ""), body.get("workspace"),
+                        target=body.get("target"), model=body.get("model"),
+                        engine=body.get("engine"),
+                    ))
                 if u.path == "/api/plan/draft/stream":
                     return self._stream_plan(body, "draft")
                 if u.path == "/api/plan/refine":
-                    return self._json(refine_plan(state, body.get("plan", {}), body.get("comments", [])))
+                    return self._json(refine_plan(
+                        state, body.get("plan", {}), body.get("comments", []),
+                        target=body.get("target"), model=body.get("model"),
+                        engine=body.get("engine"),
+                    ))
                 if u.path == "/api/plan/refine/stream":
                     return self._stream_plan(body, "refine")
                 if u.path == "/api/job/submit":
@@ -748,30 +1124,43 @@ def make_handler(state: State):
                 raise ValueError("message required")
             mode = body.get("mode", "agentic")
             ws = body.get("workspace")
+            target = body.get("target", "local")
+            model = body.get("model")
+            engine = body.get("engine")
             if mode == "plain":
-                msgs = [{"role": "system", "content": _runtime_preamble(ws)}]
+                msgs = [{"role": "system", "content": _runtime_preamble(
+                    ws, target=target, model=model, engine=engine,
+                )}]
                 if ws:
                     ctx = workspace_summary(ws)
                     if ctx:
                         msgs.append({"role": "system",
                                      "content": "Use this workspace as context:\n" + ctx})
                 msgs.append({"role": "user", "content": message})
-                return {"mode": "plain", "final_answer": state.complete(msgs), "steps": []}
-            app = state.app_for(ws)
+                return {"mode": "plain",
+                        "final_answer": state.complete(
+                            msgs, target=target, model=model, engine=engine,
+                        ),
+                        "steps": [], "target": target, "model": model, "engine": engine}
+            app = state.app_for(ws, target=target, model=model, engine=engine)
             res = app.chat(message, body.get("session_id"))
             return {"mode": "agentic", "session_id": res.get("session_id"),
                     "final_answer": res.get("final_answer"), "steps": res.get("steps", []),
-                    "transcript": res.get("transcript", [])}
+                    "transcript": res.get("transcript", []),
+                    "target": target, "model": model, "engine": engine}
 
         def _submit(self, body):
             plan = body.get("plan") or {}
             target = body.get("target", "local")
             ws = body.get("workspace") or plan.get("workspace") or ""
+            model = body.get("model")
+            engine = body.get("engine")
             if target == "local":
-                return submit_local(state, plan, ws)
+                return submit_local(state, plan, ws, model=model, engine=engine)
             # Map a cluster-name target to its cluster.yaml (account/partition/setup);
             # a bare ssh alias passes through unchanged.
-            return submit_remote(plan, target, state.cluster_path(target), ws)
+            return submit_remote(plan, target, state.cluster_path(target), ws,
+                                 model=model, engine=engine)
 
         def _cancel(self, body):
             # Remote jobs: scancel (SLURM) / best-effort kill (ssh). Local jobs run in an

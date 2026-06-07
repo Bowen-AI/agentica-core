@@ -28,3 +28,6 @@ slurm-agentic = "agentica_core.cli:main"  # back-compat alias
 
 [tool.setuptools.packages.find]
 include = ["agentica_core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

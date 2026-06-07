@@ -50,6 +50,8 @@ def run_job(
     provider: str = "ollama",
     model_name: str | None = None,
     ollama_host: str = "http://127.0.0.1:11434",
+    api_base: str | None = None,
+    api_key: str | None = None,
     model=None,
     model_timeout: float = 120.0,
     checkpoint_dir: str | None = None,
@@ -80,6 +82,8 @@ def run_job(
         provider=provider,
         model_name=model_name,
         ollama_host=ollama_host,
+        api_base=api_base,
+        api_key=api_key,
         write_roots=["."],
         max_steps=plan.max_steps_per_iteration,
     )
@@ -256,6 +260,8 @@ def main(argv=None) -> int:
     parser.add_argument("--provider", default="ollama")
     parser.add_argument("--model", default=None)
     parser.add_argument("--ollama-host", default="http://127.0.0.1:11434")
+    parser.add_argument("--api-base", default=None)
+    parser.add_argument("--api-key", default=None)
     parser.add_argument("--model-timeout", type=float, default=120.0)
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--result", default=None, help="Write the JobOutcome JSON here.")
@@ -265,6 +271,7 @@ def main(argv=None) -> int:
     outcome = run_job(
         plan, workspace=args.workspace, db_path=args.db,
         provider=args.provider, model_name=args.model, ollama_host=args.ollama_host,
+        api_base=args.api_base, api_key=args.api_key,
         model_timeout=args.model_timeout, checkpoint_dir=args.checkpoint_dir,
     )
     if args.result:

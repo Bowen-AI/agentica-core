@@ -130,17 +130,40 @@ def detect_scheduler(transport: Transport, cluster: ClusterConfig) -> str:
 
 def bring_up_ssh(transport: Transport, cluster: ClusterConfig,
                  model: ModelConfig | None = None) -> ServeHandle:
-    """Plain GPU box (no SLURM): start ollama directly over ssh and pull the model."""
+    """Plain GPU box (no SLURM): start the model server directly over ssh."""
     m = model or cluster.model
     p = m.serve_port
-    cmd = (
-        f"export OLLAMA_HOST=0.0.0.0:{p}; mkdir -p ~/.slurm-agentic; "
-        f"(curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 || "
-        f"(nohup ollama serve >~/.slurm-agentic/serve.log 2>&1 &)); "
-        f"for i in $(seq 1 60); do curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 && break; sleep 1; done; "
-        f'ollama pull "{m.name}"'
-    )
-    transport.exec(cmd, timeout=1800).check("start ollama on plain server")
+    if m.engine == "ollama":
+        cmd = (
+            f"export OLLAMA_HOST=0.0.0.0:{p}; mkdir -p ~/.slurm-agentic; "
+            f"(curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 || "
+            f"(nohup ollama serve >~/.slurm-agentic/serve.log 2>&1 &)); "
+            f"for i in $(seq 1 60); do curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 && break; sleep 1; done; "
+            f'ollama pull "{m.name}"'
+        )
+    else:
+        setup = "; ".join(cluster.setup) + "; " if cluster.setup else ""
+        try:
+            quant = m.quantization or catalog.choose_quant(
+                catalog.get_model(m.name) or catalog.MODELS["qwen3-32b"],
+                catalog.get_gpu(cluster.slurm.gpu_type),
+            )
+        except Exception:  # noqa: BLE001 - bare ssh target may not have a discovered GPU type yet
+            quant = m.quantization
+        quant_flag = f"--quantization {quant} " if quant in {"awq", "gptq", "fp8"} else ""
+        cmd = (
+            f"mkdir -p ~/.slurm-agentic; {setup}"
+            f"(curl -sf http://127.0.0.1:{p}/v1/models >/dev/null 2>&1 || "
+            f"(nohup python -m vllm.entrypoints.openai.api_server "
+            f'--model "{m.name}" --port {p} --host 0.0.0.0 '
+            f"--tensor-parallel-size {m.tensor_parallel_size} "
+            f"--pipeline-parallel-size {m.pipeline_parallel_size} "
+            f"--gpu-memory-utilization {m.gpu_memory_utilization} "
+            f"--max-model-len {m.max_model_len} {quant_flag}"
+            f">~/.slurm-agentic/vllm-{p}.log 2>&1 &)); "
+            f"for i in $(seq 1 180); do curl -sf http://127.0.0.1:{p}/v1/models >/dev/null 2>&1 && break; sleep 2; done"
+        )
+    transport.exec(cmd, timeout=1800).check("start model server on plain server")
     return ServeHandle(job_id="(ssh-direct)", node="127.0.0.1", port=p, engine=m.engine,
                        model=m.name, remote_url=f"http://127.0.0.1:{p}")
 

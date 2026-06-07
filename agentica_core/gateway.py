@@ -244,14 +244,18 @@ def _load_history(app: AgentServerApp, session_id: str) -> list[dict]:
 
 
 def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str,
-              auth_token: str | None, system_prompt: str | None = None) -> AgentServerApp:
-    """Construct an AgentServerApp whose model adapter points at a (tunneled) ollama host."""
+              auth_token: str | None, system_prompt: str | None = None,
+              provider: str = "ollama", api_base: str | None = None,
+              api_key: str | None = None) -> AgentServerApp:
+    """Construct an AgentServerApp whose model adapter points at the selected runtime."""
     kwargs = dict(
         workspace=workspace,
         db_path=db_path,
-        provider="ollama",
+        provider=provider,
         model_name=model_name,
         ollama_host=ollama_host,
+        api_base=api_base,
+        api_key=api_key,
         write_roots=["outputs"],
         enable_network_tools=True,
     )

@@ -47,21 +47,38 @@ def render_job_sbatch(cluster: ClusterConfig, plan: PlanConfig, remote_jobdir: s
 
     port = model.serve_port
     setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
-    body = setup + f"""set -uo pipefail
-echo "JOB_NODE=$(hostname)"
-export PYTHONPATH="{remote_jobdir}/code:${{PYTHONPATH:-}}"
-export OLLAMA_HOST=0.0.0.0:{port}
+    if model.engine == "ollama":
+        serve = f"""export OLLAMA_HOST=0.0.0.0:{port}
 export OLLAMA_KEEP_ALIVE=24h
 ollama serve &
 SERVE_PID=$!
 for i in $(seq 1 120); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
 ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist already)"
+RUNNER_PROVIDER_ARGS=(--provider ollama --ollama-host "http://127.0.0.1:{port}")
+"""
+    else:
+        quant_flag = f"--quantization {model.quantization} " if model.quantization in {"awq", "gptq", "fp8"} else ""
+        serve = f"""python -m vllm.entrypoints.openai.api_server \\
+  --model "{model.name}" \\
+  --port {port} --host 0.0.0.0 \\
+  --tensor-parallel-size {model.tensor_parallel_size} \\
+  --pipeline-parallel-size {model.pipeline_parallel_size} \\
+  --gpu-memory-utilization {model.gpu_memory_utilization} \\
+  --max-model-len {model.max_model_len} {quant_flag}&
+SERVE_PID=$!
+for i in $(seq 1 300); do curl -sf "http://127.0.0.1:{port}/v1/models" >/dev/null 2>&1 && break; sleep 2; done
+RUNNER_PROVIDER_ARGS=(--provider openai-compatible --api-base "http://127.0.0.1:{port}/v1")
+"""
+    body = setup + f"""set -uo pipefail
+echo "JOB_NODE=$(hostname)"
+export PYTHONPATH="{remote_jobdir}/code:${{PYTHONPATH:-}}"
+{serve}
 python -m agentica_core.on_node_runner \\
   --plan "{remote_jobdir}/plan.yaml" \\
   --workspace "{remote_jobdir}/workspace" \\
   --db "{remote_jobdir}/job.db" \\
-  --provider ollama --model "{model.name}" \\
-  --ollama-host "http://127.0.0.1:{port}" \\
+  --model "{model.name}" \\
+  "${{RUNNER_PROVIDER_ARGS[@]}}" \\
   --model-timeout {model.timeout_s} \\
   --checkpoint-dir "{remote_jobdir}/checkpoints" \\
   --result "{remote_jobdir}/result.json"
@@ -130,20 +147,35 @@ def _ssh_runner_script(cluster: ClusterConfig, plan: PlanConfig, remote_jobdir: 
     model = plan.effective_model(cluster)
     port = model.serve_port
     setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
+    if model.engine == "ollama":
+        serve = f"""export OLLAMA_HOST=0.0.0.0:{port}
+export OLLAMA_KEEP_ALIVE=24h
+(curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 || (nohup ollama serve >{remote_jobdir}/ollama.log 2>&1 &))
+for i in $(seq 1 90); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
+ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist)"
+RUNNER_PROVIDER_ARGS=(--provider ollama --ollama-host "http://127.0.0.1:{port}")
+"""
+    else:
+        quant_flag = f"--quantization {model.quantization} " if model.quantization in {"awq", "gptq", "fp8"} else ""
+        serve = f"""(curl -sf "http://127.0.0.1:{port}/v1/models" >/dev/null 2>&1 || (nohup python -m vllm.entrypoints.openai.api_server \\
+  --model "{model.name}" --port {port} --host 0.0.0.0 \\
+  --tensor-parallel-size {model.tensor_parallel_size} \\
+  --pipeline-parallel-size {model.pipeline_parallel_size} \\
+  --gpu-memory-utilization {model.gpu_memory_utilization} \\
+  --max-model-len {model.max_model_len} {quant_flag}>{remote_jobdir}/vllm.log 2>&1 &))
+for i in $(seq 1 180); do curl -sf "http://127.0.0.1:{port}/v1/models" >/dev/null 2>&1 && break; sleep 2; done
+RUNNER_PROVIDER_ARGS=(--provider openai-compatible --api-base "http://127.0.0.1:{port}/v1")
+"""
     return f"""#!/bin/bash
 set -uo pipefail
 cd {remote_jobdir}
 {setup}export PYTHONPATH="{remote_jobdir}/code:${{PYTHONPATH:-}}"
 PY=$(command -v python3.12 || command -v python3.11 || command -v python3)
-export OLLAMA_HOST=0.0.0.0:{port}
-export OLLAMA_KEEP_ALIVE=24h
-(curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 || (nohup ollama serve >{remote_jobdir}/ollama.log 2>&1 &))
-for i in $(seq 1 90); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
-ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist)"
+{serve}
 "$PY" -m agentica_core.on_node_runner \\
   --plan "{remote_jobdir}/plan.yaml" --workspace "{remote_jobdir}/workspace" \\
-  --db "{remote_jobdir}/job.db" --provider ollama --model "{model.name}" \\
-  --ollama-host "http://127.0.0.1:{port}" --model-timeout {model.timeout_s} \\
+  --db "{remote_jobdir}/job.db" --model "{model.name}" \\
+  "${{RUNNER_PROVIDER_ARGS[@]}}" --model-timeout {model.timeout_s} \\
   --result "{remote_jobdir}/result.json"
 echo "JOB_DONE rc=$?" > {remote_jobdir}/done.marker
 """
