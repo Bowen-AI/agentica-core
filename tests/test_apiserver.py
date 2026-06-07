@@ -11,6 +11,8 @@ def _state(monkeypatch_reply: str):
     st = apiserver.State(ollama_host="http://127.0.0.1:11434", model="test-model",
                          workspace="sample_workspace", db_path="/tmp/agentica-test.db")
     st.complete = lambda messages, **k: monkeypatch_reply  # type: ignore[assignment]
+    # draft/refine use the streaming planner path (think=False, fmt=json)
+    st.complete_stream = lambda messages, *a, **k: monkeypatch_reply  # type: ignore[assignment]
     return st
 
 

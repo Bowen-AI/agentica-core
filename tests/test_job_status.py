@@ -51,6 +51,12 @@ def test_status_struct_running_when_in_queue(monkeypatch):
     assert s["status"] == "running" and s["outcome"] is None
 
 
+def test_status_struct_queued_when_pending(monkeypatch):
+    # SLURM PENDING should read as "queued", not "running", so the UI can say so.
+    _patch(monkeypatch, _FakeTransport(squeue={"state": "PENDING", "reason": "(Resources)"}))
+    assert job.status_struct("host", "job-1", jobdir="/d")["status"] == "queued"
+
+
 def test_status_struct_error_when_ended_without_result(monkeypatch):
     # left the queue, sacct shows a terminal state, but no result.json -> error (don't poll forever)
     _patch(monkeypatch, _FakeTransport(squeue=None, sacct="FAILED"))

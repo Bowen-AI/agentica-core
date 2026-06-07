@@ -126,6 +126,48 @@ class State:
             reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
             raise RuntimeError(f"model unreachable at {self.ollama_host}: {reason}")
 
+    def complete_stream(self, messages: list[dict], on_reasoning=None, on_content=None,
+                        think: bool = True, fmt: str | None = None,
+                        temperature: float = 0.2, timeout: float = 600) -> str:
+        """Streaming completion via Ollama's native /api/chat. Calls
+        on_reasoning(text)/on_content(text) per delta and returns the full content.
+
+        `think=False` disables the model's chain-of-thought (qwen3.5 et al.) -- the
+        planner uses this so a simple plan returns in seconds instead of after a
+        minute-plus of reasoning. `fmt="json"` constrains output to valid JSON
+        (so plan parsing can't fail on malformed model output)."""
+        url = self.ollama_host + "/api/chat"
+        payload: dict = {"model": self.resolve_model(), "messages": messages,
+                         "think": think, "stream": True, "options": {"temperature": temperature}}
+        if fmt:
+            payload["format"] = fmt
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        content: list[str] = []
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message") or {}
+                    if msg.get("thinking") and on_reasoning:
+                        on_reasoning(msg["thinking"])
+                    if msg.get("content"):
+                        content.append(msg["content"])
+                        if on_content:
+                            on_content(msg["content"])
+                    if chunk.get("done"):
+                        break
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
+            raise RuntimeError(f"model unreachable at {self.ollama_host}: {reason}")
+        return "".join(content)
+
 
 # --------------------------------------------------------------------------- #
 # workspace context + planning
@@ -149,7 +191,7 @@ def workspace_summary(ws: str, max_files: int = 40, max_bytes: int = 1500) -> st
     return "\n".join(lines)
 
 
-def draft_plan(state: State, goal: str, workspace: str | None) -> dict:
+def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None) -> dict:
     ctx = workspace_summary(workspace) if workspace else ""
     sys = ("You are a planning assistant. Given a goal, produce a concrete, ordered, checkable "
            "plan. The plan is carried out by an AUTONOMOUS agent that has file read/write and "
@@ -161,7 +203,10 @@ def draft_plan(state: State, goal: str, workspace: str | None) -> dict:
            "\"artifacts\": [str, ...]}. Steps are short imperative lines. No prose outside JSON.")
     user = (f"Goal:\n{goal}\n\n" + (f"Workspace context:\n{ctx}\n\n" if ctx else "")
             + "Return the JSON plan.")
-    raw = state.complete([{"role": "system", "content": sys}, {"role": "user", "content": user}])
+    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+    # Planning is a simple structured task -> disable chain-of-thought (fast: seconds, not
+    # minutes) and force valid JSON so parsing can't fail.
+    raw = state.complete_stream(msgs, on_reasoning, think=False, fmt="json")
     parsed = _extract_json(raw) or {}
     steps = parsed.get("steps") or _fallback_steps(raw)
     # The model authored the tests string -> NOT a vetted gate (see _plan_payload).
@@ -170,7 +215,7 @@ def draft_plan(state: State, goal: str, workspace: str | None) -> dict:
                          tests_authoritative=False)
 
 
-def refine_plan(state: State, plan: dict, comments: list[dict]) -> dict:
+def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=None) -> dict:
     steps = [ln["text"] for ln in plan.get("lines", [])]
     rendered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
     cmts = "\n".join(
@@ -181,7 +226,8 @@ def refine_plan(state: State, plan: dict, comments: list[dict]) -> dict:
     user = (f"Goal:\n{plan.get('goal', '')}\n\nCurrent plan:\n{rendered}\n\n"
             f"Tests: {plan.get('tests', '')}\nArtifacts: {plan.get('artifacts', [])}\n\n"
             f"User comments:\n{cmts}\n\nReturn the revised JSON plan.")
-    raw = state.complete([{"role": "system", "content": sys}, {"role": "user", "content": user}])
+    msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+    raw = state.complete_stream(msgs, on_reasoning, think=False, fmt="json")
     parsed = _extract_json(raw) or {}
     new_steps = parsed.get("steps") or steps
     return _plan_payload(parsed.get("title") or plan.get("title", ""), plan.get("goal", ""),
@@ -563,6 +609,21 @@ def make_handler(state: State):
             except Exception:  # noqa: BLE001 - client disconnected
                 pass
 
+        def _stream_plan(self, body, kind):
+            # Stream the planner's "thinking" while it works (reasoning models take
+            # minutes), then emit the finished plan -- so "Draft plan" / "Send notes"
+            # show live progress instead of a multi-minute blank spinner.
+            self._sse_start()
+            on_r = lambda t: self._safe_sse({"reasoning": t})  # noqa: E731
+            try:
+                if kind == "draft":
+                    plan = draft_plan(state, body.get("goal", ""), body.get("workspace"), on_reasoning=on_r)
+                else:
+                    plan = refine_plan(state, body.get("plan", {}), body.get("comments", []), on_reasoning=on_r)
+                self._sse({"plan": plan, "done": True})
+            except Exception as exc:  # noqa: BLE001
+                self._safe_sse({"error": str(exc), "done": True})
+
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
@@ -612,10 +673,16 @@ def make_handler(state: State):
                     return self._stream_install()
                 if u.path == "/api/plan/draft":
                     return self._json(draft_plan(state, body.get("goal", ""), body.get("workspace")))
+                if u.path == "/api/plan/draft/stream":
+                    return self._stream_plan(body, "draft")
                 if u.path == "/api/plan/refine":
                     return self._json(refine_plan(state, body.get("plan", {}), body.get("comments", [])))
+                if u.path == "/api/plan/refine/stream":
+                    return self._stream_plan(body, "refine")
                 if u.path == "/api/job/submit":
                     return self._json(self._submit(body))
+                if u.path == "/api/job/cancel":
+                    return self._json(self._cancel(body))
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -651,6 +718,16 @@ def make_handler(state: State):
             # Map a cluster-name target to its cluster.yaml (account/partition/setup);
             # a bare ssh alias passes through unchanged.
             return submit_remote(plan, target, state.cluster_path(target), ws)
+
+        def _cancel(self, body):
+            # Remote jobs: scancel (SLURM) / best-effort kill (ssh). Local jobs run in an
+            # in-process thread that can't be interrupted -- the UI just dismisses the panel.
+            jid = body.get("job") or ""
+            if not jid:
+                return {"ok": False, "error": "cancel needs a remote job id"}
+            out: list[str] = []
+            rc = job.cancel(state.cluster_path(body.get("target", "")), jid, _print=out.append)
+            return {"ok": rc == 0, "status": "cancelled", "lines": out}
 
         def _job_status(self, q):
             local_id = (q.get("local_id") or [None])[0]

@@ -229,9 +229,11 @@ def status_struct(cluster_path: str, job_id: str, jobdir: str | None = None) -> 
             out["lines"] = [f"job {job_id}: {marker.out.strip()} (finished; no result.json — check logs)"]
             return out
     info = transport.squeue_job(job_id)
-    if info:  # still in the SLURM queue -> running/pending
-        lines.append(f"job {job_id}: state={info.get('state')} node={info.get('nodelist', '-')}")
-        out["status"] = "running"
+    if info:  # still in the SLURM queue -> queued (PENDING) or running
+        st = (info.get("state") or "").upper()
+        out["status"] = "queued" if st in {"PENDING", "PD", "CONFIGURING", "CF", "REQUEUED"} else "running"
+        reason = info.get("nodelist") or info.get("reason") or "-"
+        lines.append(f"job {job_id}: state={info.get('state')} node/reason={reason}")
     else:
         sacct = transport.sacct_state(job_id)
         if sacct in _SLURM_TERMINAL_FAIL:  # ended (incl. COMPLETED) but no result.json above
