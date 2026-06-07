@@ -76,3 +76,19 @@ def test_workspace_summary_lists_files(tmp_path):
 
 def test_workspace_summary_missing_dir():
     assert apiserver.workspace_summary("/nonexistent/path/xyz") == ""
+
+
+def test_load_clusters_and_cluster_path_mapping(tmp_path):
+    (tmp_path / "disco.yaml").write_text(
+        "name: disco\nssh:\n  host: discovery.usc.edu\nscheduler: slurm\n")
+    (tmp_path / "plan.yaml").write_text("title: p\ngoal: do x\n")  # not a cluster -> skipped
+    clusters = apiserver.load_clusters(str(tmp_path))
+    assert set(clusters) == {"disco"}
+    assert clusters["disco"]["scheduler"] == "slurm"
+    assert clusters["disco"]["host"] == "discovery.usc.edu"
+
+    st = apiserver.State(ollama_host="http://h", model="m", workspace="w",
+                         db_path="/tmp/agentica-cl.db", clusters_dir=str(tmp_path))
+    assert st.cluster_path("disco") == str(tmp_path / "disco.yaml")   # cluster -> yaml path
+    assert st.cluster_path("pinotage.usc.edu") == "pinotage.usc.edu"  # bare alias passthrough
+    assert st.cluster_path("local") == "local"

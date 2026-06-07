@@ -41,10 +41,33 @@ __version__ = "0.1.0"
 
 
 # --------------------------------------------------------------------------- #
+# cluster targets (so the UI can drive SLURM, not just bare ssh aliases)
+# --------------------------------------------------------------------------- #
+def load_clusters(clusters_dir: str | None) -> dict[str, dict]:
+    """Scan a folder of cluster.yaml files into {name: {path, host, scheduler}} so
+    the UI can offer SLURM/ssh clusters (which carry account/partition/setup) as job
+    targets. Files that don't parse as a ClusterConfig (e.g. plan.yaml) are skipped."""
+    d = (clusters_dir or os.environ.get("AGENTICA_CLUSTERS_DIR")
+         or os.path.expanduser("~/.config/agentica/clusters"))
+    out: dict[str, dict] = {}
+    root = Path(d)
+    if not root.is_dir():
+        return out
+    for f in sorted([*root.glob("*.yaml"), *root.glob("*.yml")]):
+        try:
+            cfg = ClusterConfig.load(f)
+        except Exception:  # noqa: BLE001 - skip non-cluster yaml / unreadable files
+            continue
+        out[cfg.name] = {"path": str(f), "host": cfg.ssh.host, "scheduler": cfg.scheduler}
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # in-memory state
 # --------------------------------------------------------------------------- #
 class State:
-    def __init__(self, *, ollama_host: str, model: str, workspace: str, db_path: str):
+    def __init__(self, *, ollama_host: str, model: str, workspace: str, db_path: str,
+                 clusters_dir: str | None = None):
         self.ollama_host = ollama_host.rstrip("/")
         self.model = model
         self.workspace = workspace
@@ -52,6 +75,13 @@ class State:
         self._apps: dict[str, object] = {}          # workspace -> AgentServerApp (agentic chat)
         self.local_jobs: dict[str, dict] = {}        # local_id -> {status, outcome, ...}
         self._model_resolved = False
+        self.clusters = load_clusters(clusters_dir)  # name -> {path, host, scheduler}
+
+    def cluster_path(self, target: str) -> str:
+        """Map a target name to its cluster.yaml path if it's a known cluster, else
+        return the target unchanged (a bare ~/.ssh/config alias, or 'local')."""
+        c = self.clusters.get(target)
+        return c["path"] if c else target
 
     def resolve_model(self) -> str:
         """Effective model for inference. If the configured model isn't installed
@@ -260,13 +290,15 @@ def submit_local(state: State, plan: dict, workspace: str) -> dict:
     return {"local": True, "local_id": local_id, "target": "local", "workspace": ws}
 
 
-def submit_remote(plan: dict, target: str, workspace: str) -> dict:
-    """Write a plan.yaml and submit to a ssh/SLURM target via job.submit."""
+def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str) -> dict:
+    """Write a plan.yaml and submit to a ssh/SLURM target via job.submit. ``target``
+    is the display name shown/polled by the UI; ``cluster_path`` is the cluster.yaml
+    (full SLURM config) or a bare ssh alias to actually connect with."""
     tmp = Path(tempfile.mkdtemp(prefix="agentica-plan-"))
     plan_path = tmp / "plan.yaml"
     plan_path.write_text(plan_to_yaml(plan, workspace or "./workspace"), encoding="utf-8")
     captured: list[str] = []
-    rc = job.submit(target, str(plan_path), sync_code=True, _print=captured.append)
+    rc = job.submit(cluster_path, str(plan_path), sync_code=True, _print=captured.append)
     jobid = jobdir = None
     for line in captured:
         if "job_id=" in line:
@@ -507,9 +539,15 @@ def make_handler(state: State):
                                 chunk = json.loads(data)
                             except json.JSONDecodeError:
                                 continue
-                            delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
-                            if delta:
-                                self._sse({"delta": delta})
+                            d = (chunk.get("choices") or [{}])[0].get("delta", {})
+                            # Reasoning models (e.g. qwen3.5) stream a long `reasoning`
+                            # trace with empty `content` while thinking -- forward it as a
+                            # distinct event so the UI shows live "thinking" instead of a
+                            # frozen empty bubble, then stream the answer as `content` lands.
+                            if d.get("reasoning"):
+                                self._sse({"reasoning": d["reasoning"]})
+                            if d.get("content"):
+                                self._sse({"delta": d["content"]})
                     self._sse({"done": True})
                 else:
                     app = state.app_for(ws)
@@ -539,6 +577,10 @@ def make_handler(state: State):
                     hosts = [{"alias": "local", "hostname": "this machine", "user": "",
                               "proxy_jump": "", "kind": "local"}]
                     hosts += [{**h, "kind": "ssh"} for h in sshconfig.list_hosts()]
+                    # Configured clusters (carry SLURM account/partition/setup) as targets.
+                    hosts += [{"alias": name, "hostname": c["host"], "user": "", "proxy_jump": "",
+                               "kind": "cluster", "scheduler": c["scheduler"]}
+                              for name, c in sorted(state.clusters.items())]
                     return self._json({"hosts": hosts, "default_model": state.model})
                 if u.path == "/api/history":
                     sid = (q.get("session_id") or [""])[0]
@@ -606,7 +648,9 @@ def make_handler(state: State):
             ws = body.get("workspace") or plan.get("workspace") or ""
             if target == "local":
                 return submit_local(state, plan, ws)
-            return submit_remote(plan, target, ws)
+            # Map a cluster-name target to its cluster.yaml (account/partition/setup);
+            # a bare ssh alias passes through unchanged.
+            return submit_remote(plan, target, state.cluster_path(target), ws)
 
         def _job_status(self, q):
             local_id = (q.get("local_id") or [None])[0]
@@ -619,9 +663,10 @@ def make_handler(state: State):
             target = (q.get("target") or [""])[0]
             jid = (q.get("job") or [""])[0]
             jobdir = (q.get("jobdir") or [None])[0]
-            out: list[str] = []
-            job.status(target, jid, jobdir=jobdir, _print=out.append)
-            return {"target": target, "job": jid, "lines": out}
+            # Structured status (status/outcome/lines) so the UI's poll loop can
+            # terminate on passed/failed/error for remote jobs just like local ones.
+            # Map a cluster-name target back to its cluster.yaml to connect.
+            return job.status_struct(state.cluster_path(target), jid, jobdir=jobdir)
 
         def _job_logs(self, q):
             local_id = (q.get("local_id") or [None])[0]
@@ -640,10 +685,13 @@ def make_handler(state: State):
 
 def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str = "sample_workspace",
           db_path: str = ".agentic/agentica.db", ollama_host: str = "http://127.0.0.1:11434",
-          model: str = "qwen3.5:4b-mlx") -> int:
-    state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path)
+          model: str = "qwen3.5:4b-mlx", clusters_dir: str | None = None) -> int:
+    state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
+                  clusters_dir=clusters_dir)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")
+    if state.clusters:
+        print(f"  cluster targets: {sorted(state.clusters)}")
     print(f"  Agentica UI dev server should call this base URL.")
     try:
         server.serve_forever()

@@ -14,14 +14,20 @@ a **plan editor** (per-line edit + comments → refine → submit). It talks to 
 backend's JSON API:
 
 ```
-agentica serve-api --model llama3.2:3b        # http://127.0.0.1:8770/api/*
-#   GET  /api/hosts            local + every ~/.ssh/config server
+agentica serve-api                            # http://127.0.0.1:8770/api/* (model defaults to qwen3.5:4b-mlx)
+#   GET  /api/hosts            local + every ~/.ssh/config server + configured clusters
 #   POST /api/chat             {message, mode: agentic|plain, workspace?}
 #   POST /api/plan/draft       {goal}            -> editable plan lines + tests
 #   POST /api/plan/refine      {plan, comments}  -> revised plan
 #   POST /api/job/submit       {plan, target}    -> local thread OR ssh/SLURM sbatch
 #   GET  /api/job/status|logs
 ```
+
+**SLURM from the UI.** Drop `cluster.yaml` files (with `account`/`partition`/`setup`)
+into `~/.config/agentica/clusters/` (or pass `--clusters-dir DIR` / set
+`$AGENTICA_CLUSTERS_DIR`) and they appear as selectable job targets in the UI's target
+picker — so a job submitted from the app carries the full SLURM config, not just a bare
+ssh alias. Plain `~/.ssh/config` aliases remain available for non-SLURM GPU boxes.
 
 The two CLI modes below still work standalone:
 

@@ -193,6 +193,57 @@ def status(cluster_path: str, job_id: str, jobdir: str | None = None, _print=pri
     return 0
 
 
+# SLURM states that mean the job ended without our result.json (i.e. it failed before
+# writing one). Used to give the UI a terminal "error" instead of polling forever.
+_SLURM_TERMINAL_FAIL = {"FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
+                        "BOOT_FAIL", "DEADLINE", "PREEMPTED", "COMPLETED"}
+
+
+def status_struct(cluster_path: str, job_id: str, jobdir: str | None = None) -> dict:
+    """Structured status for the JSON API / UI (mirrors the local-job shape):
+    {status: passed|failed|error|running, outcome: dict|None, lines: [str], target, job}.
+    result.json is authoritative; absent it, squeue/sacct decide running vs failed."""
+    cluster = ClusterConfig.resolve(cluster_path)
+    transport = Transport.from_cluster(cluster)
+    out: dict = {"target": cluster_path, "job": job_id, "status": "running",
+                 "outcome": None, "lines": []}
+    lines: list[str] = []
+    if jobdir:
+        res = transport.exec(f"cat {jobdir}/result.json 2>/dev/null || true")
+        if res.out.strip():
+            try:
+                data = json.loads(res.out)
+                out["outcome"] = data
+                out["status"] = "passed" if data.get("passed") else "failed"
+                lines.append(f"job {job_id}: state=COMPLETED")
+                lines.append(f"  result: passed={data.get('passed')} iterations={data.get('iterations')} "
+                             f"verdict={data.get('verdict')} tests_ok={data.get('tests_ok')}")
+                lines += [str(x) for x in (data.get("log") or [])]
+                out["lines"] = lines
+                return out
+            except json.JSONDecodeError:
+                pass
+        marker = transport.exec(f"cat {jobdir}/done.marker 2>/dev/null || true")
+        if marker.out.strip():
+            out["status"] = "error"  # finished but never wrote result.json
+            out["lines"] = [f"job {job_id}: {marker.out.strip()} (finished; no result.json — check logs)"]
+            return out
+    info = transport.squeue_job(job_id)
+    if info:  # still in the SLURM queue -> running/pending
+        lines.append(f"job {job_id}: state={info.get('state')} node={info.get('nodelist', '-')}")
+        out["status"] = "running"
+    else:
+        sacct = transport.sacct_state(job_id)
+        if sacct in _SLURM_TERMINAL_FAIL:  # ended (incl. COMPLETED) but no result.json above
+            out["status"] = "error"
+            lines.append(f"job {job_id}: state={sacct} but no result.json — check logs")
+        else:
+            out["status"] = "running"
+            lines.append(f"job {job_id}: state={'RUNNING' if sacct == 'UNKNOWN' else sacct} (no result.json yet)")
+    out["lines"] = lines
+    return out
+
+
 def logs(cluster_path: str, job_id: str, jobdir: str | None = None, tail: int = 80, _print=print) -> int:
     cluster = ClusterConfig.resolve(cluster_path)
     transport = Transport.from_cluster(cluster)

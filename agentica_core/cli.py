@@ -29,6 +29,10 @@ def main(argv=None) -> int:
     p_api.add_argument("--db", default=".agentic/agentica.db")
     p_api.add_argument("--ollama-host", default="http://127.0.0.1:11434")
     p_api.add_argument("--model", default="qwen3.5:4b-mlx")
+    p_api.add_argument("--clusters-dir", default=None,
+                       help="Folder of cluster.yaml files exposed as job targets (SLURM "
+                            "account/partition/setup). Default: $AGENTICA_CLUSTERS_DIR or "
+                            "~/.config/agentica/clusters.")
 
     p_up = sub.add_parser("up", help="Bring up the interactive gateway.")
     p_up.add_argument("cluster", help="Path to cluster.yaml")
@@ -86,7 +90,8 @@ def main(argv=None) -> int:
     if args.command == "serve-api":
         from . import apiserver
         return apiserver.serve(host=args.host, port=args.port, workspace=args.workspace,
-                               db_path=args.db, ollama_host=args.ollama_host, model=args.model)
+                               db_path=args.db, ollama_host=args.ollama_host, model=args.model,
+                               clusters_dir=args.clusters_dir)
     if args.command == "up":
         from . import gateway
         return gateway.up(args.cluster, ollama_host=args.ollama_host, model_override=args.model,
