@@ -378,10 +378,14 @@ def ollama_models(host: str, timeout: float = 4.0) -> list[str]:
     try:
         with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
-    except Exception:
+        # ollama usually returns {"models": [...]}, but {"models": null} when none are
+        # pulled (and .get's default only applies to a MISSING key, not a null value) --
+        # the parse must stay inside the try so this can't escape as a 500.
+        models = (data or {}).get("models") or []
+        names = {m.get("name") or m.get("model") for m in models if isinstance(m, dict)}
+        return sorted(n for n in names if n)
+    except Exception:  # noqa: BLE001 - any transport/parse failure -> "no models"
         return []
-    names = {m.get("name") or m.get("model") for m in data.get("models", [])}
-    return sorted(n for n in names if n)
 
 
 def find_ollama_bin() -> str | None:
@@ -395,17 +399,23 @@ def model_present(model: str, models: list[str]) -> bool:
 
 
 def setup_status(state: "State") -> dict:
-    running = ollama_reachable(state.ollama_host)
-    models = ollama_models(state.ollama_host) if running else []
-    present = model_present(state.model, models)
-    return {
-        "ollama_installed": bool(find_ollama_bin()) or running,
-        "ollama_running": running,
-        "models": models,
-        "model": state.model,
-        "model_present": present,
-        "ready": running and present,
-    }
+    # A status check must NEVER 500 -- degrade to "not ready" on any unexpected error.
+    try:
+        running = ollama_reachable(state.ollama_host)
+        models = ollama_models(state.ollama_host) if running else []
+        present = model_present(state.model or "", models)
+        return {
+            "ollama_installed": bool(find_ollama_bin()) or running,
+            "ollama_running": running,
+            "models": models,
+            "model": state.model,
+            "model_present": present,
+            "ready": running and present,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ollama_installed": False, "ollama_running": False, "models": [],
+                "model": getattr(state, "model", ""), "model_present": False,
+                "ready": False, "error": str(exc)}
 
 
 def start_ollama(host: str, timeout_s: float = 25.0) -> tuple[bool, str]:

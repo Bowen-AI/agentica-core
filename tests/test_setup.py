@@ -50,6 +50,31 @@ def test_resolve_model_keeps_configured_when_ollama_empty(monkeypatch):
     assert _state("qwen3.5:4b-mlx").resolve_model() == "qwen3.5:4b-mlx"
 
 
+def test_ollama_models_handles_null_models(monkeypatch):
+    # ollama returns {"models": null} when none are pulled -- this used to crash
+    # ollama_models with TypeError and surface as /api/setup -> 500.
+    class FakeResp:
+        status = 200
+        def read(self):
+            return b'{"models": null}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(apiserver.urllib.request, "urlopen", lambda *a, **k: FakeResp())
+    assert apiserver.ollama_models("http://x") == []
+
+
+def test_setup_status_never_500s(monkeypatch):
+    # Even if a helper raises unexpectedly, setup_status returns a valid degraded status.
+    monkeypatch.setattr(apiserver, "ollama_reachable", lambda h, **k: True)
+    monkeypatch.setattr(apiserver, "ollama_models",
+                        lambda h, **k: (_ for _ in ()).throw(TypeError("boom")))
+    s = apiserver.setup_status(_state("qwen3.5:4b-mlx"))
+    assert s["ready"] is False and s["model"] == "qwen3.5:4b-mlx"
+
+
 def test_setup_status_when_ollama_down(monkeypatch):
     monkeypatch.setattr(apiserver, "ollama_reachable", lambda h, **k: False)
     monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: None)
