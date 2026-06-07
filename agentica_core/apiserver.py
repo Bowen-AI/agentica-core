@@ -19,6 +19,7 @@ remote (job.submit over ssh/SLURM, any ~/.ssh/config target).
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -38,6 +39,34 @@ from .config import ClusterConfig, PlanConfig, SuccessCriteria
 from .on_node_runner import run_job
 
 __version__ = "0.1.0"
+
+
+# --------------------------------------------------------------------------- #
+# runtime context injected into the model (open models have a stale training
+# cutoff and no idea of "now" / where they run -- give them a live preamble).
+# --------------------------------------------------------------------------- #
+AGENTICA_SYSTEM_PROMPT = (
+    "You are Agentica, a helpful AI assistant running locally on the user's own computer. "
+    "Answer directly, or use your tools (read/write files, run shell commands, search the web) "
+    "to get things done in the workspace -- the runtime executes tools and enforces policy. "
+    "Be concise and accurate; if you don't know something, say so instead of guessing."
+)
+
+
+def _runtime_preamble(workspace: str | None = None) -> str:
+    """Live context for the model -- authoritative for any date/time/'today'/'now'
+    question (the model's own training data is stale)."""
+    now = datetime.datetime.now().astimezone()
+    osname = "macOS" if os.uname().sysname == "Darwin" else os.uname().sysname
+    lines = [
+        "Live context (authoritative -- your training data is stale, prefer THIS for any "
+        "date, time, 'today', 'now', or 'current' question):",
+        f"- Current date & time: {now:%A, %B %-d, %Y at %-I:%M %p} {now.tzname() or ''}".rstrip(),
+        f"- You are running locally on {osname} ({os.uname().machine}).",
+    ]
+    if workspace:
+        lines.append(f"- Working directory: {workspace}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,11 +134,15 @@ class State:
 
     def app_for(self, workspace: str | None):
         ws = workspace or self.workspace
-        if ws not in self._apps:
-            self._apps[ws] = gateway.build_app(
+        # Key by date too, so a long-running backend rebuilds with a fresh "today" in
+        # the system preamble (the AgentServerApp caches its controller/system prompt).
+        key = (ws, datetime.date.today().isoformat())
+        if key not in self._apps:
+            self._apps[key] = gateway.build_app(
                 ollama_host=self.ollama_host, model_name=self.resolve_model(),
-                workspace=ws, db_path=self.db_path, auth_token=None)
-        return self._apps[ws]
+                workspace=ws, db_path=self.db_path, auth_token=None,
+                system_prompt=AGENTICA_SYSTEM_PROMPT + "\n\n" + _runtime_preamble(ws))
+        return self._apps[key]
 
     def complete(self, messages: list[dict], temperature: float = 0.2, timeout: float = 180) -> str:
         """Plain (non-agentic) chat completion via the engine's OpenAI /v1."""
@@ -201,8 +234,8 @@ def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None
            "\"tests\": str (a shell command that genuinely verifies success via exit code -- e.g. "
            "grep/diff/an assertion script, NOT a bare echo/print that always succeeds, or \"\"), "
            "\"artifacts\": [str, ...]}. Steps are short imperative lines. No prose outside JSON.")
-    user = (f"Goal:\n{goal}\n\n" + (f"Workspace context:\n{ctx}\n\n" if ctx else "")
-            + "Return the JSON plan.")
+    user = (_runtime_preamble(workspace) + "\n\n" + f"Goal:\n{goal}\n\n"
+            + (f"Workspace context:\n{ctx}\n\n" if ctx else "") + "Return the JSON plan.")
     msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
     # Planning is a simple structured task -> disable chain-of-thought (fast: seconds, not
     # minutes) and force valid JSON so parsing can't fail.
@@ -601,7 +634,7 @@ def make_handler(state: State):
             ws = body.get("workspace")
             try:
                 if mode == "plain":
-                    msgs = []
+                    msgs = [{"role": "system", "content": _runtime_preamble(ws)}]
                     if ws:
                         ctx = workspace_summary(ws)
                         if ctx:
@@ -716,7 +749,7 @@ def make_handler(state: State):
             mode = body.get("mode", "agentic")
             ws = body.get("workspace")
             if mode == "plain":
-                msgs = []
+                msgs = [{"role": "system", "content": _runtime_preamble(ws)}]
                 if ws:
                     ctx = workspace_summary(ws)
                     if ctx:

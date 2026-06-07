@@ -244,9 +244,9 @@ def _load_history(app: AgentServerApp, session_id: str) -> list[dict]:
 
 
 def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str,
-              auth_token: str | None) -> AgentServerApp:
+              auth_token: str | None, system_prompt: str | None = None) -> AgentServerApp:
     """Construct an AgentServerApp whose model adapter points at a (tunneled) ollama host."""
-    return AgentServerApp(
+    kwargs = dict(
         workspace=workspace,
         db_path=db_path,
         provider="ollama",
@@ -255,6 +255,10 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
         write_roots=["outputs"],
         enable_network_tools=True,
     )
+    try:
+        return AgentServerApp(**kwargs, system_prompt=system_prompt)
+    except TypeError:  # older AgenticLocal without the system_prompt param
+        return AgentServerApp(**kwargs)
 
 
 def run_gateway_server(handler_cls, host: str, port: int) -> ThreadingHTTPServer:
