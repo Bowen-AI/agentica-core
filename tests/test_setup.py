@@ -28,7 +28,16 @@ def test_setup_status(monkeypatch):
     assert s["models"] == ["gemma4:e4b", "qwen3.5:9b"]
 
     s2 = apiserver.setup_status(_state("not-pulled:7b"))
-    assert s2["ollama_running"] and not s2["model_present"] and not s2["ready"]
+    # configured model absent, but other models exist -> still READY (resolve_model uses one)
+    assert s2["ollama_running"] and not s2["model_present"] and s2["ready"]
+
+
+def test_setup_status_not_ready_with_no_models(monkeypatch):
+    monkeypatch.setattr(apiserver, "ollama_reachable", lambda h, **k: True)
+    monkeypatch.setattr(apiserver, "ollama_models", lambda h, **k: [])
+    monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: "/usr/bin/ollama")
+    s = apiserver.setup_status(_state("qwen3.5:4b-mlx"))
+    assert s["ollama_running"] and not s["ready"]  # nothing installed yet -> pull the default
 
 
 def test_resolve_model_keeps_configured_when_present(monkeypatch):
@@ -92,6 +101,7 @@ def test_install_returns_true_when_already_installed(monkeypatch):
 
 def test_install_is_graceful_without_zstd(monkeypatch):
     # ollama missing, download works, but no decompressor available -> graceful False, no raise.
+    monkeypatch.setattr(apiserver, "_IS_MAC", False)  # exercise the Linux (.tar.zst) path
     monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: None)
     monkeypatch.setattr(apiserver.urllib.request, "urlretrieve", lambda *a, **k: ("x", None))
     monkeypatch.setattr(apiserver, "_zstd_decompress", lambda src, dst: False)

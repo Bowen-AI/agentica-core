@@ -364,6 +364,17 @@ def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str) ->
 # ollama setup / install / models  (defensive: these never raise to the caller)
 # --------------------------------------------------------------------------- #
 OLLAMA_HOME = Path(os.path.expanduser("~/.local/share/agentica/ollama"))
+_IS_MAC = os.uname().sysname == "Darwin"
+
+
+def _provisioned_ollama_bin() -> Path:
+    # mac (ollama-darwin.tgz) extracts FLAT: ollama + libs at the root.
+    # linux (tar.zst) extracts to bin/ollama + lib/.
+    return OLLAMA_HOME / ("ollama" if _IS_MAC else "bin/ollama")
+
+
+def _provisioned_ollama_lib() -> Path:
+    return OLLAMA_HOME if _IS_MAC else OLLAMA_HOME / "lib"
 
 
 def ollama_reachable(host: str, timeout: float = 2.0) -> bool:
@@ -389,8 +400,8 @@ def ollama_models(host: str, timeout: float = 4.0) -> list[str]:
 
 
 def find_ollama_bin() -> str | None:
-    rootless = OLLAMA_HOME / "bin" / "ollama"
-    return shutil.which("ollama") or (str(rootless) if rootless.exists() else None)
+    prov = _provisioned_ollama_bin()
+    return shutil.which("ollama") or (str(prov) if prov.exists() else None)
 
 
 def model_present(model: str, models: list[str]) -> bool:
@@ -410,7 +421,9 @@ def setup_status(state: "State") -> dict:
             "models": models,
             "model": state.model,
             "model_present": present,
-            "ready": running and present,
+            # Ready once Ollama is up and ANY model is installed -- resolve_model()
+            # will use an existing model, so we only need to pull when there are none.
+            "ready": running and bool(models),
         }
     except Exception as exc:  # noqa: BLE001
         return {"ollama_installed": False, "ollama_running": False, "models": [],
@@ -427,9 +440,12 @@ def start_ollama(host: str, timeout_s: float = 25.0) -> tuple[bool, str]:
     p = urlparse(host)
     env = dict(os.environ)
     env["OLLAMA_HOST"] = f"{p.hostname or '127.0.0.1'}:{p.port or 11434}"
-    lib = OLLAMA_HOME / "lib"
-    if lib.exists():
-        env["LD_LIBRARY_PATH"] = f"{lib}:{env.get('LD_LIBRARY_PATH', '')}"
+    # Only point the dynamic loader at our provisioned libs when we're starting our
+    # provisioned binary (a system ollama brings its own).
+    lib = _provisioned_ollama_lib()
+    if str(binp) == str(_provisioned_ollama_bin()) and lib.exists():
+        key = "DYLD_LIBRARY_PATH" if _IS_MAC else "LD_LIBRARY_PATH"
+        env[key] = f"{lib}:{env.get(key, '')}"
     try:
         subprocess.Popen([binp, "serve"], env=env, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
@@ -458,34 +474,46 @@ def _zstd_decompress(src: Path, dst: Path) -> bool:
 
 
 def install_ollama_rootless(progress) -> bool:
-    """Rootless Ollama install into ~/.local (no sudo). Reports progress via the
-    callback; designed to NEVER raise -- failures are reported and return False."""
+    """Provision Ollama into ~/.local/share/agentica/ollama (no sudo, no GUI install)
+    so the app is zero-setup. macOS uses the standalone ollama-darwin.tgz (flat); Linux
+    uses ollama-linux-<arch>.tar.zst. Reports progress; NEVER raises (reports + returns False)."""
     try:
         if find_ollama_bin():
             progress("Ollama is already available.")
             return True
-        arch = "amd64" if os.uname().machine in ("x86_64", "amd64") else "arm64"
-        url = f"https://github.com/ollama/ollama/releases/latest/download/ollama-linux-{arch}.tar.zst"
         OLLAMA_HOME.mkdir(parents=True, exist_ok=True)
-        tarzst, tar = OLLAMA_HOME / "ollama.tar.zst", OLLAMA_HOME / "ollama.tar"
-        progress(f"Downloading rootless Ollama ({arch})...")
-        urllib.request.urlretrieve(url, tarzst)
-        progress("Decompressing...")
-        if not _zstd_decompress(tarzst, tar):
-            progress("ERROR: need `zstd` or python `zstandard` to unpack Ollama — "
-                     "install one, or get Ollama from https://ollama.com/download")
-            return False
-        progress("Extracting...")
-        subprocess.run(["tar", "-xf", str(tar), "-C", str(OLLAMA_HOME)], check=True)
-        for f in (tarzst, tar):
+        base = "https://github.com/ollama/ollama/releases/latest/download"
+        if _IS_MAC:
+            tgz = OLLAMA_HOME / "ollama-darwin.tgz"
+            progress("Downloading Ollama for macOS (~143 MB, one time)...")
+            urllib.request.urlretrieve(f"{base}/ollama-darwin.tgz", tgz)
+            progress("Extracting...")
+            subprocess.run(["tar", "-xzf", str(tgz), "-C", str(OLLAMA_HOME)], check=True)
             try:
-                f.unlink()
+                tgz.unlink()
             except OSError:
                 pass
-        if not (OLLAMA_HOME / "bin" / "ollama").exists():
-            progress("ERROR: extraction did not produce bin/ollama")
+        else:
+            arch = "amd64" if os.uname().machine in ("x86_64", "amd64") else "arm64"
+            tarzst, tar = OLLAMA_HOME / "ollama.tar.zst", OLLAMA_HOME / "ollama.tar"
+            progress(f"Downloading Ollama for Linux ({arch}, one time)...")
+            urllib.request.urlretrieve(f"{base}/ollama-linux-{arch}.tar.zst", tarzst)
+            progress("Decompressing...")
+            if not _zstd_decompress(tarzst, tar):
+                progress("ERROR: need `zstd` or python `zstandard` to unpack Ollama — "
+                         "install one, or get Ollama from https://ollama.com/download")
+                return False
+            progress("Extracting...")
+            subprocess.run(["tar", "-xf", str(tar), "-C", str(OLLAMA_HOME)], check=True)
+            for f in (tarzst, tar):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        if not _provisioned_ollama_bin().exists():
+            progress("ERROR: extraction did not produce the ollama binary")
             return False
-        progress("Installed rootless Ollama into ~/.local/share/agentica/ollama")
+        progress("Installed Ollama into ~/.local/share/agentica/ollama")
         return True
     except Exception as exc:  # noqa: BLE001
         progress(f"ERROR: install failed: {exc}")
