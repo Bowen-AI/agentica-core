@@ -37,12 +37,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import catalog, gateway, job, serving, sshconfig
+from .voice_stream import stream_agent_turn
+from .voice_gateway import start_voice_gateway
 from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, ModelConfig,
                      PlanConfig, SuccessCriteria)
 from .on_node_runner import run_job
 from .transport import Transport
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 
 # --------------------------------------------------------------------------- #
@@ -673,17 +675,46 @@ def plan_to_yaml(plan: dict, workspace: str, model: str | None = None,
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+def _derive_protect(test_cmd: str | None, ws: str) -> list[str]:
+    """Best-effort: the file path(s) referenced by the test command that already
+    exist in the workspace = the grader(s) to snapshot+restore (tamper-evidence)."""
+    import shlex
+    try:
+        toks = shlex.split(test_cmd or "")
+    except ValueError:
+        toks = (test_cmd or "").split()
+    wsp = Path(ws)
+    out: list[str] = []
+    for t in toks:
+        t = t.strip()
+        if not t or t.startswith("-"):
+            continue
+        if ("/" in t or "." in t) and (wsp / t).exists() and (wsp / t).is_file():
+            out.append(t)
+    return out
+
+
 def submit_local(state: State, plan: dict, workspace: str, model: str | None = None,
                  engine: str | None = None) -> dict:
     """Run the agentic job in a background thread against local ollama."""
     local_id = "local-" + uuid.uuid4().hex[:8]
     ws = workspace or tempfile.mkdtemp(prefix="agentica-job-")
     Path(ws).mkdir(parents=True, exist_ok=True)
+    tests_cmd = plan.get("tests") or None
     pc = PlanConfig(
         title=plan.get("title", "job"), goal=plan.get("goal", ""), workspace=ws,
         checklist=[ln["text"] for ln in plan.get("lines", [])],
-        success_criteria=SuccessCriteria(tests=plan.get("tests") or None,
-                                         artifacts=plan.get("artifacts", [])),
+        success_criteria=SuccessCriteria(
+            tests=tests_cmd,
+            artifacts=plan.get("artifacts", []),
+            # Snapshot+restore the grader file(s) referenced by the test command so the
+            # agent (which has shell + write access to the workspace) can't tamper the
+            # gate it is judged by. Without this the tamper snapshot is empty (the C3 bug).
+            protect=_derive_protect(tests_cmd, ws),
+            # Model-drafted tests are not a vetted gate -> the backstop won't auto-PASS on
+            # them alone (see on_node_runner).
+            tests_authoritative=bool(plan.get("tests_authoritative", True)),
+        ),
         max_iterations=3, max_steps_per_iteration=12)
     rec = {"local_id": local_id, "target": "local", "status": "running",
            "workspace": ws, "log": [], "outcome": None}
@@ -904,8 +935,25 @@ def make_handler(state: State):
 
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Agentica-Token")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _authorized(self) -> bool:
+            # CORS:* lets any page SEND a request; the shared token is the actual
+            # boundary that stops it from DRIVING the agent / reading the result.
+            tok = getattr(state, "api_token", None)
+            if not tok:
+                return True  # auth disabled (manual serve-api / dev)
+            got = self.headers.get("X-Agentica-Token") or ""
+            if not got:
+                auth = self.headers.get("Authorization") or ""
+                if auth.lower().startswith("bearer "):
+                    got = auth[7:].strip()
+            if not got:
+                got = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+            # constant-time compare
+            import hmac
+            return hmac.compare_digest(got, tok)
 
         def _json(self, payload, status=200):
             raw = json.dumps(payload, default=str).encode()
@@ -969,6 +1017,14 @@ def make_handler(state: State):
                 self._safe_sse({"status": msg, "ok": started})
             self._safe_sse({"done": True, "ok": ok, **setup_status(state)})
 
+        def _stream_voice_install(self):
+            # Provision local STT/TTS (Whisper wheel + Piper binary/voice) into the
+            # data dir, streaming progress — same UX as the Ollama installer.
+            self._sse_start()
+            from .voice_provision import install_voice, voice_status
+            ok = install_voice(lambda m: self._safe_sse({"status": m}))
+            self._safe_sse({"done": True, "ok": ok, **voice_status()})
+
         def _stream_chat(self, body):
             self._sse_start()
             message = (body.get("message") or "").strip()
@@ -1002,7 +1058,13 @@ def make_handler(state: State):
                         ws, target=target, model=model, engine=engine,
                         notify=lambda t: self._safe_sse({"status": t}),
                     )
-                    res = app.chat(message, body.get("session_id"))
+                    # Stream per-step {step}/{artifact} frames as tools fire (the
+                    # loop used to run monolithically -> a blank wait until done),
+                    # then the authoritative terminal frame replaces them.
+                    res = stream_agent_turn(
+                        app, message, body.get("session_id"),
+                        emit=lambda frame: self._safe_sse(frame),
+                    )
                     self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
                                "session_id": res.get("session_id"), "done": True})
             except Exception as exc:  # noqa: BLE001
@@ -1040,6 +1102,8 @@ def make_handler(state: State):
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
             try:
                 if u.path == "/api/health":
                     return self._json({"ok": True, "version": __version__, "model": state.model})
@@ -1076,12 +1140,17 @@ def make_handler(state: State):
                     return self._json(self._job_status(q))
                 if u.path == "/api/job/logs":
                     return self._json(self._job_logs(q))
+                if u.path == "/api/voice/status":
+                    from .voice_provision import voice_status
+                    return self._json(voice_status())
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
 
         def do_POST(self):
             u = urlparse(self.path)
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
             try:
                 body = self._body()
                 if u.path == "/api/chat":
@@ -1113,6 +1182,10 @@ def make_handler(state: State):
                     return self._json(self._submit(body))
                 if u.path == "/api/job/cancel":
                     return self._json(self._cancel(body))
+                if u.path == "/api/voice/install":
+                    return self._stream_voice_install()
+                if u.path == "/api/voice/gemini/token":
+                    return self._json(self._gemini_token(body))
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1161,6 +1234,23 @@ def make_handler(state: State):
             # a bare ssh alias passes through unchanged.
             return submit_remote(plan, target, state.cluster_path(target), ws,
                                  model=model, engine=engine)
+
+        def _gemini_token(self, body):
+            # Mint an ephemeral Gemini Live token so the renderer can open a
+            # realtime audio WebSocket directly to Google (cloud voice engine).
+            # The key is supplied by the user (request body) or env; we only mint
+            # a short-lived token, we don't persist the key. The agent turn +
+            # canvas stay local. Returns {error} (not a 500) when no key is given.
+            key = (body.get("api_key") or os.environ.get("GEMINI_API_KEY")
+                   or os.environ.get("GOOGLE_API_KEY"))
+            if not key:
+                return {"error": "Add your Gemini API key in Settings to use the cloud voice engine."}
+            try:
+                from agentic_loop.voice_adapters import GeminiLiveTokenClient
+                client = GeminiLiveTokenClient(api_key=key)
+                return client.create_token(body.get("purpose", "voice"), body.get("session_id"))
+            except Exception as exc:  # noqa: BLE001
+                return {"error": str(exc)}
 
         def _cancel(self, body):
             # Remote jobs: scancel (SLURM) / best-effort kill (ssh). Local jobs run in an
@@ -1219,6 +1309,19 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         print(f"warning: could not create data dir {data_dir}: {exc}")
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
                   clusters_dir=clusters_dir)
+    # Per-launch shared secret (the desktop app mints it and passes it to BOTH
+    # the backend env and the renderer). When set, every API + WS request must
+    # carry it — this is what stops a visited web page from driving the local
+    # agent (loopback bind + CORS:* alone do not). Unset (manual `serve-api`) =
+    # open localhost for dev convenience.
+    state.api_token = os.environ.get("AGENTICA_API_TOKEN")
+    if state.api_token:
+        print("  API auth: enabled (token required on :%d and :%d)" % (port, port + 1))
+    else:
+        print("  API auth: DISABLED (no AGENTICA_API_TOKEN) — dev/localhost only")
+    # Full-duplex voice transport for the "local" voice engine (mic up / TTS down
+    # + barge-in). Daemon thread; degrades to None if `websockets` isn't installed.
+    start_voice_gateway(state, host=host, port=port + 1)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")
     if state.clusters:

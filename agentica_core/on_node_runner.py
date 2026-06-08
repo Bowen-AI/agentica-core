@@ -127,7 +127,20 @@ def run_job(
         note(f"[auditor] verdict={verdict} gaps={gaps[:200]!r}")
 
         backstops_ok = tests_ok and artifacts_ok
-        passed = backstops_ok and verdict != "FAIL"
+        # An authoritative gate = a VETTED (not model-drafted) test, or a required
+        # artifact. With one, a non-FAIL verdict + green backstops passes. WITHOUT one
+        # the deterministic backstop verified nothing, so don't let the model that did
+        # the work auto-pass itself on `verdict != FAIL` -- require an explicit positive
+        # PASS and flag it provisional (closes the empty-criteria / drafted-test gaming).
+        has_authoritative = bool((sc.tests and sc.tests_authoritative) or sc.artifacts)
+        if has_authoritative:
+            passed = backstops_ok and verdict != "FAIL"
+        else:
+            if sc.tests and not sc.tests_authoritative:
+                note("[backstop] tests are model-drafted (not a vetted gate) -- PASS is provisional")
+            else:
+                note("[backstop] no authoritative success criteria -- PASS is model-graded (provisional)")
+            passed = backstops_ok and verdict == "PASS"
         _checkpoint(checkpoint_dir, f"iter{i}", {
             "tests_ok": tests_ok, "artifacts_ok": artifacts_ok,
             "verdict": verdict, "gaps": gaps, "passed": passed,

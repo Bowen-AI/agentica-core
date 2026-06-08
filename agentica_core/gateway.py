@@ -24,13 +24,15 @@ import urllib.request
 
 from agentic_loop.model_selection import ModelSelection
 from agentic_loop.server import AgentServerApp
+from agentic_loop.tools import create_default_tools
 
 from .config import ClusterConfig
 from . import serving
 from .transport import Transport, TransportError
+from .voice_tools import register_voice_tools
 from .webchat import chat_page_html
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 
 # --------------------------------------------------------------------------- #
@@ -259,10 +261,30 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
         write_roots=["outputs"],
         enable_network_tools=True,
     )
-    try:
-        return AgentServerApp(**kwargs, system_prompt=system_prompt)
-    except TypeError:  # older AgenticLocal without the system_prompt param
-        return AgentServerApp(**kwargs)
+
+    # Canvas/visual tools (get_weather, ...) are layered onto the default tools
+    # via the AgentServerApp tools_factory hook -- kept in agentica-core so the
+    # release never needs them in AgenticLocal's git main.
+    def _tools_factory():
+        return register_voice_tools(create_default_tools(enable_network=True))
+
+    # Pass tools_factory + system_prompt, degrading on an older engine that
+    # lacks either kwarg (a release that pip-installs an older AgenticLocal).
+    # IMPORTANT: keep a tools_factory-ONLY rung before the bare {} so that an
+    # engine which has tools_factory but not system_prompt (e.g. AgenticLocal
+    # main) still gets the canvas tools (get_weather, ...) instead of silently
+    # falling all the way through to {} and losing them.
+    for extra in (
+        {"tools_factory": _tools_factory, "system_prompt": system_prompt},
+        {"tools_factory": _tools_factory},
+        {"system_prompt": system_prompt},
+        {},
+    ):
+        try:
+            return AgentServerApp(**kwargs, **extra)
+        except TypeError:
+            continue
+    return AgentServerApp(**kwargs)
 
 
 def run_gateway_server(handler_cls, host: str, port: int) -> ThreadingHTTPServer:

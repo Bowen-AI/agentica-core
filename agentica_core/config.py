@@ -207,6 +207,9 @@ class SuccessCriteria:
     # {path: [symbol, ...]} -> the artifact must DEFINE these top-level names (AST-checked),
     # not merely exist -- closes the "empty/stub file satisfies the artifact gate" gap.
     artifact_symbols: dict = field(default_factory=dict)
+    # False when the tests command was DRAFTED by the model (not a vetted gate). The
+    # backstop treats a passing non-authoritative test as PROVISIONAL, not a clean PASS.
+    tests_authoritative: bool = True
 
 
 @dataclass
