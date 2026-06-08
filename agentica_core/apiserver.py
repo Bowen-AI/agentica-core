@@ -44,7 +44,7 @@ from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, Mode
 from .on_node_runner import run_job
 from .transport import Transport
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 # --------------------------------------------------------------------------- #
@@ -675,17 +675,46 @@ def plan_to_yaml(plan: dict, workspace: str, model: str | None = None,
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+def _derive_protect(test_cmd: str | None, ws: str) -> list[str]:
+    """Best-effort: the file path(s) referenced by the test command that already
+    exist in the workspace = the grader(s) to snapshot+restore (tamper-evidence)."""
+    import shlex
+    try:
+        toks = shlex.split(test_cmd or "")
+    except ValueError:
+        toks = (test_cmd or "").split()
+    wsp = Path(ws)
+    out: list[str] = []
+    for t in toks:
+        t = t.strip()
+        if not t or t.startswith("-"):
+            continue
+        if ("/" in t or "." in t) and (wsp / t).exists() and (wsp / t).is_file():
+            out.append(t)
+    return out
+
+
 def submit_local(state: State, plan: dict, workspace: str, model: str | None = None,
                  engine: str | None = None) -> dict:
     """Run the agentic job in a background thread against local ollama."""
     local_id = "local-" + uuid.uuid4().hex[:8]
     ws = workspace or tempfile.mkdtemp(prefix="agentica-job-")
     Path(ws).mkdir(parents=True, exist_ok=True)
+    tests_cmd = plan.get("tests") or None
     pc = PlanConfig(
         title=plan.get("title", "job"), goal=plan.get("goal", ""), workspace=ws,
         checklist=[ln["text"] for ln in plan.get("lines", [])],
-        success_criteria=SuccessCriteria(tests=plan.get("tests") or None,
-                                         artifacts=plan.get("artifacts", [])),
+        success_criteria=SuccessCriteria(
+            tests=tests_cmd,
+            artifacts=plan.get("artifacts", []),
+            # Snapshot+restore the grader file(s) referenced by the test command so the
+            # agent (which has shell + write access to the workspace) can't tamper the
+            # gate it is judged by. Without this the tamper snapshot is empty (the C3 bug).
+            protect=_derive_protect(tests_cmd, ws),
+            # Model-drafted tests are not a vetted gate -> the backstop won't auto-PASS on
+            # them alone (see on_node_runner).
+            tests_authoritative=bool(plan.get("tests_authoritative", True)),
+        ),
         max_iterations=3, max_steps_per_iteration=12)
     rec = {"local_id": local_id, "target": "local", "status": "running",
            "workspace": ws, "log": [], "outcome": None}
@@ -906,8 +935,25 @@ def make_handler(state: State):
 
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Agentica-Token")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _authorized(self) -> bool:
+            # CORS:* lets any page SEND a request; the shared token is the actual
+            # boundary that stops it from DRIVING the agent / reading the result.
+            tok = getattr(state, "api_token", None)
+            if not tok:
+                return True  # auth disabled (manual serve-api / dev)
+            got = self.headers.get("X-Agentica-Token") or ""
+            if not got:
+                auth = self.headers.get("Authorization") or ""
+                if auth.lower().startswith("bearer "):
+                    got = auth[7:].strip()
+            if not got:
+                got = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
+            # constant-time compare
+            import hmac
+            return hmac.compare_digest(got, tok)
 
         def _json(self, payload, status=200):
             raw = json.dumps(payload, default=str).encode()
@@ -1056,6 +1102,8 @@ def make_handler(state: State):
         def do_GET(self):
             u = urlparse(self.path)
             q = parse_qs(u.query)
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
             try:
                 if u.path == "/api/health":
                     return self._json({"ok": True, "version": __version__, "model": state.model})
@@ -1101,6 +1149,8 @@ def make_handler(state: State):
 
         def do_POST(self):
             u = urlparse(self.path)
+            if not self._authorized():
+                return self._json({"error": "unauthorized"}, 401)
             try:
                 body = self._body()
                 if u.path == "/api/chat":
@@ -1259,6 +1309,16 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         print(f"warning: could not create data dir {data_dir}: {exc}")
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
                   clusters_dir=clusters_dir)
+    # Per-launch shared secret (the desktop app mints it and passes it to BOTH
+    # the backend env and the renderer). When set, every API + WS request must
+    # carry it — this is what stops a visited web page from driving the local
+    # agent (loopback bind + CORS:* alone do not). Unset (manual `serve-api`) =
+    # open localhost for dev convenience.
+    state.api_token = os.environ.get("AGENTICA_API_TOKEN")
+    if state.api_token:
+        print("  API auth: enabled (token required on :%d and :%d)" % (port, port + 1))
+    else:
+        print("  API auth: DISABLED (no AGENTICA_API_TOKEN) — dev/localhost only")
     # Full-duplex voice transport for the "local" voice engine (mic up / TTS down
     # + barge-in). Daemon thread; degrades to None if `websockets` isn't installed.
     start_voice_gateway(state, host=host, port=port + 1)

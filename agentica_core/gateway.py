@@ -270,8 +270,13 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
 
     # Pass tools_factory + system_prompt, degrading on an older engine that
     # lacks either kwarg (a release that pip-installs an older AgenticLocal).
+    # IMPORTANT: keep a tools_factory-ONLY rung before the bare {} so that an
+    # engine which has tools_factory but not system_prompt (e.g. AgenticLocal
+    # main) still gets the canvas tools (get_weather, ...) instead of silently
+    # falling all the way through to {} and losing them.
     for extra in (
         {"tools_factory": _tools_factory, "system_prompt": system_prompt},
+        {"tools_factory": _tools_factory},
         {"system_prompt": system_prompt},
         {},
     ):

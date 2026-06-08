@@ -16,8 +16,13 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import wave
 from pathlib import Path
+
+# Serialize first-use model construction (reached from the gateway's executor):
+# without it two concurrent first-uses each build a multi-hundred-MB model.
+_load_lock = threading.Lock()
 
 VOICE_HOME = Path(os.environ.get("AGENTICA_VOICE_HOME") or
                   os.path.expanduser("~/.local/share/agentica/voice"))
@@ -37,6 +42,10 @@ KOKORO_MODEL_URL = (
 KOKORO_VOICES_URL = (
     "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 )
+# Pinned SHA-256 of the model assets — verified before the onnx is loaded so a
+# re-uploaded/compromised release asset can't be silently used.
+KOKORO_MODEL_SHA256 = "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"
+KOKORO_VOICES_SHA256 = "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
 
 
 class VoiceUnavailable(RuntimeError):
@@ -118,6 +127,14 @@ def _load_whisper():
     global _whisper_model
     if _whisper_model is not None:
         return _whisper_model
+    with _load_lock:  # double-checked: don't build two copies on concurrent first use
+        if _whisper_model is not None:
+            return _whisper_model
+        return _build_whisper()
+
+
+def _build_whisper():
+    global _whisper_model
     try:
         from faster_whisper import WhisperModel
     except Exception as exc:  # noqa: BLE001
@@ -159,14 +176,17 @@ def _load_kokoro():
     global _kokoro
     if _kokoro is not None:
         return _kokoro
-    try:
-        from kokoro_onnx import Kokoro
-    except Exception as exc:  # noqa: BLE001
-        raise VoiceUnavailable("kokoro-onnx not installed (pip install kokoro-onnx)") from exc
-    if not (KOKORO_MODEL.exists() and KOKORO_VOICES.exists()):
-        raise VoiceUnavailable("Kokoro model/voices not provisioned")
-    _kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
-    return _kokoro
+    with _load_lock:  # double-checked: don't build two copies on concurrent first use
+        if _kokoro is not None:
+            return _kokoro
+        try:
+            from kokoro_onnx import Kokoro
+        except Exception as exc:  # noqa: BLE001
+            raise VoiceUnavailable("kokoro-onnx not installed (pip install kokoro-onnx)") from exc
+        if not (KOKORO_MODEL.exists() and KOKORO_VOICES.exists()):
+            raise VoiceUnavailable("Kokoro model/voices not provisioned")
+        _kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
+        return _kokoro
 
 
 def synthesize_kokoro_pcm(text: str, voice: str | None = None) -> tuple[bytes, int]:
@@ -314,19 +334,47 @@ def install_voice(progress=lambda m: None) -> bool:
     return ok
 
 
+def _download_verified(url: str, dest: Path, progress, *, sha256: str | None = None, label: str = "") -> None:
+    """Download to a temp file, verify sha256 (if pinned), then atomically rename.
+    Never leaves a partial/poisoned file at ``dest``; never chmod/loads an
+    unverified asset when a hash is pinned."""
+    import hashlib
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    progress(f"downloading {label or dest.name}…")
+    urllib.request.urlretrieve(url, tmp)
+    if sha256:
+        h = hashlib.sha256()
+        with open(tmp, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        got = h.hexdigest()
+        if got != sha256.lower():
+            tmp.unlink(missing_ok=True)
+            raise VoiceUnavailable(f"checksum mismatch for {dest.name}: expected {sha256[:12]}…, got {got[:12]}…")
+    else:
+        progress(f"warning: no pinned checksum for {dest.name} (trust-on-first-use)")
+    os.replace(tmp, dest)
+
+
 def _download_piper(progress) -> None:
     import platform
     import tarfile
-    import urllib.request
 
     sysname = "darwin" if platform.system() == "Darwin" else "linux"
     url = PIPER_RELEASES[sysname]
     PIPER_DIR.mkdir(parents=True, exist_ok=True)
-    progress(f"downloading piper ({sysname})…")
     tgz = PIPER_DIR / "piper.tar.gz"
-    urllib.request.urlretrieve(url, tgz)
+    _download_verified(url, tgz, progress, label=f"piper ({sysname})")
     with tarfile.open(tgz, "r:gz") as tf:
-        tf.extractall(PIPER_DIR)
+        # filter='data' rejects absolute paths / .. members (Zip-Slip / Python
+        # 3.12+ default; required explicitly on the 3.11 runtime).
+        try:
+            tf.extractall(PIPER_DIR, filter="data")
+        except TypeError:
+            tf.extractall(PIPER_DIR)  # very old tarfile without the filter kwarg
     # piper tarballs extract into a "piper/" subdir — flatten it.
     nested = PIPER_DIR / "piper" / ("piper" if os.name != "nt" else "piper.exe")
     if nested.exists():
@@ -350,13 +398,11 @@ def _download_piper_voice(progress) -> None:
 
 
 def _download_kokoro(progress) -> None:
-    import urllib.request
-
     KOKORO_DIR.mkdir(parents=True, exist_ok=True)
     if not KOKORO_MODEL.exists():
-        progress("downloading Kokoro voice model (~310MB)…")
-        urllib.request.urlretrieve(KOKORO_MODEL_URL, KOKORO_MODEL)
+        _download_verified(KOKORO_MODEL_URL, KOKORO_MODEL, progress,
+                           sha256=KOKORO_MODEL_SHA256, label="Kokoro voice model (~310MB)")
     if not KOKORO_VOICES.exists():
-        progress("downloading Kokoro voices…")
-        urllib.request.urlretrieve(KOKORO_VOICES_URL, KOKORO_VOICES)
+        _download_verified(KOKORO_VOICES_URL, KOKORO_VOICES, progress,
+                           sha256=KOKORO_VOICES_SHA256, label="Kokoro voices")
     progress("kokoro (natural TTS) installed")

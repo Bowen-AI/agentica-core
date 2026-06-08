@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
+import os
 import threading
 from typing import Any
 
@@ -74,7 +76,10 @@ async def _serve(state, host, port):
     async def handler(ws, *_):
         await _Conn(state, ws).run()
 
-    async with websockets.serve(handler, host, port, max_size=8 * 1024 * 1024):
+    # ping_interval keeps the socket alive + detects a dead client (the mic stays
+    # open otherwise); max_size bounds a single audio frame.
+    async with websockets.serve(handler, host, port, max_size=8 * 1024 * 1024,
+                                ping_interval=20, ping_timeout=20):
         await asyncio.Future()  # run forever
 
 
@@ -90,8 +95,14 @@ class _Conn:
         self.session_id = None
         self.turn_id = 0
         self.task: asyncio.Task | None = None
+        self.cancel: threading.Event | None = None  # set on barge-in to stop the agent loop
         self.audio = bytearray()
         self.audio_sr = 16000
+        # Same shared-secret gate as the HTTP API: when AGENTICA_API_TOKEN is set
+        # the client's `start` message must carry it, else any local process /
+        # web page could open ws://127.0.0.1:8771 and drive the agent.
+        self._required_token = os.environ.get("AGENTICA_API_TOKEN")
+        self.authed = not self._required_token
 
     async def run(self):
         try:
@@ -118,6 +129,19 @@ class _Conn:
 
     async def _dispatch(self, msg):
         t = msg.get("type")
+        # Authenticate on the start frame; reject everything until authed.
+        if not self.authed:
+            if t == "start" and self._required_token and hmac.compare_digest(
+                str(msg.get("token") or ""), self._required_token
+            ):
+                self.authed = True
+            else:
+                await self._send({"type": "error", "error": "unauthorized"})
+                try:
+                    await self.ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
         if t == "start":
             self.engine = msg.get("engine", "browser")
             self.target = msg.get("target", "local")
@@ -144,18 +168,25 @@ class _Conn:
             if phrase:
                 self._spawn_turn(phrase)
         elif t == "barge_in":
-            self.turn_id += 1  # supersede in-flight emits + speaking
-            if self.task:
-                self.task.cancel()
+            self._interrupt()  # supersede emits/speaking AND stop the agent loop
 
     def _app(self):
         return self.state.app_for(self.workspace, target=self.target, model=self.model, engine=None)
 
+    def _interrupt(self):
+        # Stop the in-flight turn: drop its emits (turn_id), stop the agent loop at
+        # its next step boundary (cancel event -> no more tools/model calls), and
+        # cancel the asyncio wrapper.
+        self.turn_id += 1
+        if self.cancel:
+            self.cancel.set()
+        if self.task and not self.task.done():
+            self.task.cancel()
+
     def _spawn_turn(self, text: str):
         if not text:
             return
-        if self.task and not self.task.done():
-            self.task.cancel()  # new utterance interrupts the previous (barge-in)
+        self._interrupt()  # a new utterance supersedes any running turn
         self.task = self.loop.create_task(self._run_turn(text))
 
     async def _transcribe_and_turn(self):
@@ -174,8 +205,11 @@ class _Conn:
         self._spawn_turn(text)
 
     async def _run_turn(self, text: str):
-        self.turn_id += 1
+        # turn_id was already advanced by _interrupt() in _spawn_turn; just capture it.
         my = self.turn_id
+        # A fresh cancel token for THIS turn, captured in the closure so a later turn
+        # replacing self.cancel can't make us pass the wrong event into the executor.
+        cancel = self.cancel = threading.Event()
         await self._send({"type": "transcript", "text": text, "final": True})
         try:
             app = self._app()
@@ -199,10 +233,19 @@ class _Conn:
         agent_text = text + _VOICE_STEER
 
         def work():
-            return stream_agent_turn(app, agent_text, self.session_id, emit)
+            return stream_agent_turn(app, agent_text, self.session_id, emit, cancel_event=cancel)
 
         try:
-            res = await self.loop.run_in_executor(None, work)
+            # Per-turn wall-clock deadline so a wedged model/tool can't leave the
+            # conversation stuck in "thinking" forever. On timeout, tell the agent
+            # loop to stop (cancel) and report the error.
+            res = await asyncio.wait_for(self.loop.run_in_executor(None, work), timeout=180)
+        except asyncio.TimeoutError:
+            cancel.set()
+            if self.turn_id == my:
+                await self._send({"type": "error", "error": "the agent took too long and was stopped"})
+                await self._send({"type": "done"})
+            return
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001

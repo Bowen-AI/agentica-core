@@ -101,25 +101,54 @@ def translate_event(ev: dict[str, Any]) -> list[dict[str, Any]]:
     return frames
 
 
+# app.events() -> storage.events_after() pages with a default LIMIT (100). For a
+# session with >100 prior events, a single call returns the OLDEST 100, so the
+# naive max() lands on the 100th id (not the latest) and the turn replays stale
+# rows. Page through to the true high-water mark and drain fully.
+_PAGE = 100
+
+
 def _max_event_id(app: Any, session_id: str) -> int:
+    hi = 0
     try:
-        events = app.events(session_id=session_id)
+        while True:
+            batch = app.events(session_id=session_id, after_id=hi)
+            if not batch:
+                break
+            hi = max(hi, max(ev["id"] for ev in batch))
+            if len(batch) < _PAGE:
+                break
     except Exception:  # noqa: BLE001 - never let event tailing break the turn
-        return 0
-    return max((ev["id"] for ev in events), default=0)
+        return hi
+    return hi
 
 
 def _drain(app: Any, session_id: str, after_id: int, emit: Callable[[dict], None]) -> int:
-    """Forward every event newer than ``after_id``; return the new high-water id."""
-    try:
-        events = app.events(session_id=session_id, after_id=after_id)
-    except Exception:  # noqa: BLE001 - transient sqlite lock: retry next poll
-        return after_id
-    for ev in events:
-        after_id = ev["id"]
-        for frame in translate_event(ev):
-            emit(frame)
-    return after_id
+    """Forward every event newer than ``after_id`` (paging fully); return the new
+    high-water id. A single turn can emit >100 rows, so loop until drained."""
+    while True:
+        try:
+            events = app.events(session_id=session_id, after_id=after_id)
+        except Exception:  # noqa: BLE001 - transient sqlite lock: retry next poll
+            return after_id
+        if not events:
+            return after_id
+        for ev in events:
+            after_id = ev["id"]
+            for frame in translate_event(ev):
+                emit(frame)
+        if len(events) < _PAGE:
+            return after_id
+
+
+def _chat(app, message, session_id, cancel_event):
+    # Pass the cancel token if this engine supports it (AgenticLocal main may not).
+    if cancel_event is not None:
+        try:
+            return app.chat(message, session_id, cancel_event=cancel_event)
+        except TypeError:
+            pass
+    return app.chat(message, session_id)
 
 
 def stream_agent_turn(
@@ -129,6 +158,7 @@ def stream_agent_turn(
     emit: Callable[[dict], None],
     *,
     poll_interval: float = 0.1,
+    cancel_event=None,
 ) -> dict[str, Any]:
     """Run an agentic turn, streaming per-step ``{step}``/``{artifact}`` frames.
 
@@ -138,7 +168,7 @@ def stream_agent_turn(
     """
     # Degrade gracefully on an engine without the tail surfaces.
     if not (hasattr(app, "events") and hasattr(app, "create_session")):
-        result = app.chat(message, session_id)
+        result = _chat(app, message, session_id, cancel_event)
         result.setdefault("session_id", session_id)
         return result
 
@@ -150,7 +180,7 @@ def stream_agent_turn(
 
     def _worker():
         try:
-            box["result"] = app.chat(message, session_id)
+            box["result"] = _chat(app, message, session_id, cancel_event)
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller below
             box["error"] = exc
 

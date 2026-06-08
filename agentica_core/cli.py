@@ -35,6 +35,10 @@ def main(argv=None) -> int:
                             "account/partition/setup). Default: $AGENTICA_CLUSTERS_DIR or "
                             "~/.config/agentica/clusters.")
 
+    p_vs = sub.add_parser("voice-status", help="Report local-voice (Whisper/Kokoro) readiness.")
+    p_vs.add_argument("--require", action="store_true",
+                      help="Exit non-zero if STT/TTS aren't ready (release smoke check).")
+
     p_up = sub.add_parser("up", help="Bring up the interactive gateway.")
     p_up.add_argument("cluster", help="Path to cluster.yaml")
     p_up.add_argument("--ollama-host", default=None,
@@ -93,6 +97,24 @@ def main(argv=None) -> int:
         return apiserver.serve(host=args.host, port=args.port, workspace=args.workspace,
                                db_path=args.db, ollama_host=args.ollama_host, model=args.model,
                                clusters_dir=args.clusters_dir)
+    if args.command == "voice-status":
+        # Smoke check for the packaged binary: are the local-voice WHEELS bundled
+        # (Whisper STT + Kokoro TTS)? Models download on first use, so --require
+        # checks importability, not stt_ready/tts_ready.
+        import json as _json
+        from .voice_provision import voice_status
+        print(_json.dumps(voice_status(), indent=2))
+        if getattr(args, "require", False):
+            missing = []
+            for mod in ("faster_whisper", "kokoro_onnx"):
+                try:
+                    __import__(mod)
+                except Exception:  # noqa: BLE001
+                    missing.append(mod)
+            if missing:
+                print(f"voice-status: voice wheels not bundled: {missing}", file=sys.stderr)
+                return 2
+        return 0
     if args.command == "up":
         from . import gateway
         return gateway.up(args.cluster, ollama_host=args.ollama_host, model_override=args.model,

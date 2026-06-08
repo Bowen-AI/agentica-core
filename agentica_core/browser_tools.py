@@ -23,6 +23,7 @@ import threading
 from typing import Any
 
 from agentic_loop.tools import Tool, ToolContext, ToolRegistry
+from .net_guard import UnsafeUrl, require_safe_public_url
 
 VIEWPORT = {"width": 1280, "height": 800}
 
@@ -114,8 +115,16 @@ class BrowserSession:
             raise BrowserUnavailable(payload)
         return payload
 
+    def stop(self):
+        """Close Chromium + its worker thread (else it lives for the whole backend
+        lifetime and can orphan)."""
+        if self._thread and self._thread.is_alive():
+            self._cmd.put(("__stop__", {}, queue.Queue()))
+
 
 _SESSION = BrowserSession()
+import atexit as _atexit  # noqa: E402
+_atexit.register(lambda: _SESSION.stop())
 
 
 def _view_artifact(result: dict, summary: str) -> dict:
@@ -142,8 +151,13 @@ def _guard(fn):
 @_guard
 def open_browser(context, arguments):
     url = str(arguments.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    if "://" not in url:
+        url = "https://" + url  # assume https for a bare host
+    try:
+        # https-only + reject loopback/private/link-local/metadata hosts (SSRF).
+        url = require_safe_public_url(url, allow_http=False)
+    except UnsafeUrl as exc:
+        return {"summary": f"I can't open that URL: {exc}"}
     res = _SESSION.call("goto", url=url)
     return _view_artifact(res, f"Opened {res.get('title') or url}.")
 
@@ -171,7 +185,7 @@ BROWSER_TOOLS = [
         name="open_browser",
         description="Open a web page in a real browser and SHOW it in the canvas. The user can click it; you can also click/type to drive it. Use for browsing, searching, or interacting with any site.",
         parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-        handler=open_browser, source="browser", risk_level="medium", ui_component_hint="browser_view",
+        handler=open_browser, source="browser", risk_level="high", ui_component_hint="browser_view",
     ),
     Tool(
         name="browser_click",
@@ -179,7 +193,7 @@ BROWSER_TOOLS = [
         parameters={"type": "object",
                     "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
                     "required": ["x", "y"]},
-        handler=browser_click, source="browser", risk_level="medium", ui_component_hint="browser_view",
+        handler=browser_click, source="browser", risk_level="high", ui_component_hint="browser_view",
     ),
     Tool(
         name="browser_type",
@@ -187,7 +201,7 @@ BROWSER_TOOLS = [
         parameters={"type": "object",
                     "properties": {"text": {"type": "string"}, "enter": {"type": "boolean"}},
                     "required": ["text"]},
-        handler=browser_type, source="browser", risk_level="medium", ui_component_hint="browser_view",
+        handler=browser_type, source="browser", risk_level="high", ui_component_hint="browser_view",
     ),
     Tool(
         name="browser_snapshot",

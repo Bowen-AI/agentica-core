@@ -210,10 +210,16 @@ def _q(text: str) -> str:
 
 def show_web(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
     """Embed a live, interactive web page in the canvas (Tier 2)."""
+    from .net_guard import UnsafeUrl, require_safe_public_url
+
     url = str(arguments.get("url") or "").strip()
     title = str(arguments.get("title") or "").strip()
-    if not url.lower().startswith("https://"):
-        return {"summary": "I can only embed secure (https) pages."}
+    try:
+        # https-only + reject loopback/private/link-local hosts (SSRF / can't
+        # embed the agent's own localhost services or LAN devices).
+        url = require_safe_public_url(url, allow_http=False)
+    except UnsafeUrl as exc:
+        return {"summary": f"I can only embed secure public pages: {exc}"}
     return {
         "summary": f"Showing {title or url} in the canvas.",
         "_artifact": {
