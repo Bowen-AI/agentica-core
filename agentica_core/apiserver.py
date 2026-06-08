@@ -37,6 +37,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import catalog, gateway, job, serving, sshconfig
+from .voice_stream import stream_agent_turn
+from .voice_gateway import start_voice_gateway
 from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, ModelConfig,
                      PlanConfig, SuccessCriteria)
 from .on_node_runner import run_job
@@ -969,6 +971,14 @@ def make_handler(state: State):
                 self._safe_sse({"status": msg, "ok": started})
             self._safe_sse({"done": True, "ok": ok, **setup_status(state)})
 
+        def _stream_voice_install(self):
+            # Provision local STT/TTS (Whisper wheel + Piper binary/voice) into the
+            # data dir, streaming progress — same UX as the Ollama installer.
+            self._sse_start()
+            from .voice_provision import install_voice, voice_status
+            ok = install_voice(lambda m: self._safe_sse({"status": m}))
+            self._safe_sse({"done": True, "ok": ok, **voice_status()})
+
         def _stream_chat(self, body):
             self._sse_start()
             message = (body.get("message") or "").strip()
@@ -1002,7 +1012,13 @@ def make_handler(state: State):
                         ws, target=target, model=model, engine=engine,
                         notify=lambda t: self._safe_sse({"status": t}),
                     )
-                    res = app.chat(message, body.get("session_id"))
+                    # Stream per-step {step}/{artifact} frames as tools fire (the
+                    # loop used to run monolithically -> a blank wait until done),
+                    # then the authoritative terminal frame replaces them.
+                    res = stream_agent_turn(
+                        app, message, body.get("session_id"),
+                        emit=lambda frame: self._safe_sse(frame),
+                    )
                     self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
                                "session_id": res.get("session_id"), "done": True})
             except Exception as exc:  # noqa: BLE001
@@ -1076,6 +1092,9 @@ def make_handler(state: State):
                     return self._json(self._job_status(q))
                 if u.path == "/api/job/logs":
                     return self._json(self._job_logs(q))
+                if u.path == "/api/voice/status":
+                    from .voice_provision import voice_status
+                    return self._json(voice_status())
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1113,6 +1132,10 @@ def make_handler(state: State):
                     return self._json(self._submit(body))
                 if u.path == "/api/job/cancel":
                     return self._json(self._cancel(body))
+                if u.path == "/api/voice/install":
+                    return self._stream_voice_install()
+                if u.path == "/api/voice/gemini/token":
+                    return self._json(self._gemini_token(body))
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1161,6 +1184,23 @@ def make_handler(state: State):
             # a bare ssh alias passes through unchanged.
             return submit_remote(plan, target, state.cluster_path(target), ws,
                                  model=model, engine=engine)
+
+        def _gemini_token(self, body):
+            # Mint an ephemeral Gemini Live token so the renderer can open a
+            # realtime audio WebSocket directly to Google (cloud voice engine).
+            # The key is supplied by the user (request body) or env; we only mint
+            # a short-lived token, we don't persist the key. The agent turn +
+            # canvas stay local. Returns {error} (not a 500) when no key is given.
+            key = (body.get("api_key") or os.environ.get("GEMINI_API_KEY")
+                   or os.environ.get("GOOGLE_API_KEY"))
+            if not key:
+                return {"error": "Add your Gemini API key in Settings to use the cloud voice engine."}
+            try:
+                from agentic_loop.voice_adapters import GeminiLiveTokenClient
+                client = GeminiLiveTokenClient(api_key=key)
+                return client.create_token(body.get("purpose", "voice"), body.get("session_id"))
+            except Exception as exc:  # noqa: BLE001
+                return {"error": str(exc)}
 
         def _cancel(self, body):
             # Remote jobs: scancel (SLURM) / best-effort kill (ssh). Local jobs run in an
@@ -1219,6 +1259,9 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         print(f"warning: could not create data dir {data_dir}: {exc}")
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
                   clusters_dir=clusters_dir)
+    # Full-duplex voice transport for the "local" voice engine (mic up / TTS down
+    # + barge-in). Daemon thread; degrades to None if `websockets` isn't installed.
+    start_voice_gateway(state, host=host, port=port + 1)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")
     if state.clusters:

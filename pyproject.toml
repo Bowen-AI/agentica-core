@@ -20,6 +20,18 @@ classifiers = [
 # time so the dev layout works without an explicit install.
 dependencies = [
   "PyYAML>=6",
+  "websockets>=12",  # voice gateway (full-duplex WS for the local voice engine)
+]
+
+[project.optional-dependencies]
+# Local open-weight speech: Whisper (STT, CTranslate2) + Kokoro (natural TTS,
+# onnxruntime). Heavy wheels + models, provisioned on first voice use rather than
+# shipped in the ~110MB app bundle. Piper (lighter TTS fallback) is a native
+# binary fetched at runtime by voice_provision, not a Python dependency.
+voice = [
+  "faster-whisper>=1.0",
+  "kokoro-onnx>=0.4",
+  "soundfile>=0.12",
 ]
 
 [project.scripts]
