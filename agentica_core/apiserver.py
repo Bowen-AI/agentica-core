@@ -44,7 +44,7 @@ from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, Mode
 from .on_node_runner import run_job
 from .transport import Transport
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # --------------------------------------------------------------------------- #

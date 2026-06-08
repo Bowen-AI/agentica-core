@@ -32,7 +32,7 @@ from .transport import Transport, TransportError
 from .voice_tools import register_voice_tools
 from .webchat import chat_page_html
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 
 # --------------------------------------------------------------------------- #
