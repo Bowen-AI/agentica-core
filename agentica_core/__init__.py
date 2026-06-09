@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 def _ensure_agentic_loop_importable() -> None:
