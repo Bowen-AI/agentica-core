@@ -39,6 +39,10 @@ def main(argv=None) -> int:
     p_vs.add_argument("--require", action="store_true",
                       help="Exit non-zero if STT/TTS aren't ready (release smoke check).")
 
+    sub.add_parser("voice-selftest",
+                   help="Round-trip STT+TTS self-test: synthesize a phrase + transcribe it "
+                        "back, proving the local voice pipeline actually works.")
+
     p_up = sub.add_parser("up", help="Bring up the interactive gateway.")
     p_up.add_argument("cluster", help="Path to cluster.yaml")
     p_up.add_argument("--ollama-host", default=None,
@@ -114,6 +118,19 @@ def main(argv=None) -> int:
             if missing:
                 print(f"voice-status: voice wheels not bundled: {missing}", file=sys.stderr)
                 return 2
+        return 0
+    if args.command == "voice-selftest":
+        import json as _json
+        from .voice_provision import selftest
+        res = selftest()
+        print(_json.dumps(res, indent=2))
+        if not res.get("ok"):
+            print("voice-selftest: FAILED — " + "; ".join(res.get("errors") or ["unknown"]),
+                  file=sys.stderr)
+            return 2
+        print("voice-selftest: OK — STT+TTS round-trip works "
+              f"(engine={res.get('tts_engine')}, heard: {res.get('roundtrip_text')!r})",
+              file=sys.stderr)
         return 0
     if args.command == "up":
         from . import gateway

@@ -1142,7 +1142,22 @@ def make_handler(state: State):
                     return self._json(self._job_logs(q))
                 if u.path == "/api/voice/status":
                     from .voice_provision import voice_status
-                    return self._json(voice_status())
+                    st = voice_status()
+                    th = getattr(state, "voice_thread", None)
+                    st["gateway_running"] = bool(th and th.is_alive())
+                    st["voice_ws_port"] = getattr(state, "voice_port", None)
+                    if not st["gateway_running"]:
+                        st["gateway_error"] = ("voice WebSocket gateway not running — "
+                                               "install 'websockets' (pip install websockets)")
+                    return self._json(st)
+                if u.path == "/api/voice/selftest":
+                    # End-to-end proof the local STT+TTS pipeline works, in-process.
+                    from .voice_provision import selftest
+                    st = selftest()
+                    th = getattr(state, "voice_thread", None)
+                    st["gateway_ok"] = bool(th and th.is_alive())
+                    st["voice_ws_port"] = getattr(state, "voice_port", None)
+                    return self._json(st)
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1321,7 +1336,10 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         print("  API auth: DISABLED (no AGENTICA_API_TOKEN) — dev/localhost only")
     # Full-duplex voice transport for the "local" voice engine (mic up / TTS down
     # + barge-in). Daemon thread; degrades to None if `websockets` isn't installed.
-    start_voice_gateway(state, host=host, port=port + 1)
+    # Capture the thread + port so /api/voice/status can report gateway health and
+    # the renderer can derive the WS port instead of hardcoding the +1 convention.
+    state.voice_port = port + 1
+    state.voice_thread = start_voice_gateway(state, host=host, port=port + 1)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")
     if state.clusters:
