@@ -116,3 +116,31 @@ def test_derive_protect_finds_test_files(tmp_path):
     got = apiserver._derive_protect("python -m pytest test_spec.py -q", str(tmp_path))
     assert got == ["test_spec.py"]
     assert apiserver._derive_protect("pytest nonexistent.py", str(tmp_path)) == []
+
+
+# --- conversational routing + answer hygiene (usability overhaul) ----------- #
+def test_needs_tools_routes_tool_intents():
+    from agentica_core.voice_gateway import _needs_tools
+    assert _needs_tools("What's the weather in Boston?")
+    assert _needs_tools("open example.com and tell me what's there")
+    assert _needs_tools("read the file notes.txt")
+    assert _needs_tools("search for the latest news")
+    assert not _needs_tools("Say hello in one short sentence.")
+    assert not _needs_tools("How are you today?")
+    assert not _needs_tools("Tell me a joke about penguins")
+
+
+def test_ack_matches_intent():
+    from agentica_core.voice_gateway import _ack_for
+    assert "weather" in _ack_for("what's the weather in Paris").lower()
+    assert _ack_for("read my notes file")  # always non-empty
+
+
+def test_clean_answer_never_speaks_loop_junk():
+    from agentica_core.voice_gateway import _clean_answer
+    junk = "Tool get_weather already completed."
+    assert _clean_answer(junk, "It's 72 and sunny in Boston.") == "It's 72 and sunny in Boston."
+    assert _clean_answer(junk, None) == "Done — the details are on your screen."
+    assert _clean_answer("", None) == "Sorry, I hit a snag with that one."
+    assert _clean_answer("It's sunny today!", None) == "It's sunny today!"
+    assert "interrupted" not in _clean_answer("(interrupted)", None)

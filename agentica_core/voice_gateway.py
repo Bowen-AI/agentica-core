@@ -48,6 +48,66 @@ _VOICE_STEER = (
     "tables, lists, or long details aloud — just summarize and point to the screen.]"
 )
 
+# ---------------------------------------------------------------------------
+# Conversational-latency machinery. A measured agentic turn takes 10-17s before
+# the FIRST audio — dead air that makes voice mode feel broken. Two fixes:
+#   * fast path: utterances that don't need tools skip the agent loop and run a
+#     plain streamed completion (think=False ≈ first tokens <1.5s), speaking each
+#     sentence as it completes → first audio ~2-3s.
+#   * ack: tool-bound turns SAY a short acknowledgment up front, so the agent is
+#     never silent while the loop works.
+# ---------------------------------------------------------------------------
+import re as _re
+
+# Tool-intent cues mirror the registered tools (get_weather, show_web, fetch_url,
+# browser_*, file/shell tools, csv, memory). Anything else is conversation.
+_TOOL_INTENT = _re.compile(
+    r"\b(weather|forecast|temperature|rain|snow|sunny|"
+    r"open|show|browse|website|web ?page|url|link|search|look ?up|news|"
+    r"read|write|create|edit|delete|list|file|files|folder|directory|csv|"
+    r"run|execute|shell|command|install|"
+    r"remember|recall|memor|"
+    r"screenshot|click|browser)\b", _re.IGNORECASE)
+
+_VOICE_SYSTEM = (
+    "You are Agentica, a friendly voice assistant. Reply in one or two short, "
+    "natural spoken sentences — no markdown, no lists, no headings. Be warm and direct."
+)
+
+# Internal agent-loop text that must never be spoken as the answer.
+_JUNK_ANSWER = _re.compile(
+    r"(tool .{0,60} already (completed|ran)|"
+    r"step limit|max[_ ]steps|\(interrupted\)|no answer was produced)", _re.IGNORECASE)
+
+
+def _needs_tools(text: str) -> bool:
+    return bool(_TOOL_INTENT.search(text or ""))
+
+
+def _ack_for(text: str) -> str:
+    t = (text or "").lower()
+    if _re.search(r"weather|forecast|temperature|rain|snow", t):
+        return "Let me check the weather."
+    if _re.search(r"news|search|look ?up", t):
+        return "Let me look that up."
+    if _re.search(r"open|show|browse|website|url|link", t):
+        return "Sure — opening that now."
+    return "On it — give me a few seconds."
+
+
+def _clean_answer(answer: str, tool_summary: str | None) -> str:
+    """The text we show AND speak. The 4B model sometimes ends a turn with loop
+    bookkeeping ('Tool get_weather already completed.') — prefer the last tool's
+    human summary over junk, and never return empty."""
+    a = (answer or "").strip()
+    if a and not _JUNK_ANSWER.search(a):
+        return a
+    if tool_summary:
+        return tool_summary
+    if a:
+        return "Done — the details are on your screen."
+    return "Sorry, I hit a snag with that one."
+
 
 def start_voice_gateway(state: Any, host: str = "127.0.0.1", port: int = 8771):
     """Start the gateway on a daemon thread. Returns the thread, or None if the
@@ -98,6 +158,9 @@ class _Conn:
         self.cancel: threading.Event | None = None  # set on barge-in to stop the agent loop
         self.audio = bytearray()
         self.audio_sr = 16000
+        # Rolling spoken-conversation history (shared by the fast path and used
+        # for continuity when turns alternate between routes). Capped small.
+        self.history: list[dict] = []
         # Same shared-secret gate as the HTTP API: when AGENTICA_API_TOKEN is set
         # the client's `start` message must carry it, else any local process /
         # web page could open ws://127.0.0.1:8771 and drive the agent.
@@ -201,26 +264,130 @@ class _Conn:
         except Exception as exc:  # noqa: BLE001
             await self._send({"type": "error", "error": f"speech-to-text unavailable: {exc}"})
             return
-        await self._send({"type": "transcript", "text": text, "final": True})
+        # (_run_turn echoes the final transcript — sending here too double-fires it.)
         self._spawn_turn(text)
 
     async def _run_turn(self, text: str):
         # turn_id was already advanced by _interrupt() in _spawn_turn; just capture it.
         my = self.turn_id
+        await self._send({"type": "transcript", "text": text, "final": True})
+        # Route: conversation -> fast streamed completion (first audio ~2-3s);
+        # tool intent -> the agent loop, but never silently (spoken ack first).
+        if not _needs_tools(text):
+            try:
+                await self._run_fast_turn(text, my)
+                return
+            except Exception:  # noqa: BLE001 - fast path down -> the full loop still works
+                if self.turn_id != my:
+                    return
+        await self._run_agent_turn(text, my)
+
+    def _remember(self, user_text: str, answer: str):
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": answer})
+        del self.history[:-12]  # keep the last 6 exchanges
+
+    async def _run_fast_turn(self, text: str, my: int):
+        """Conversational path: plain streamed completion, SPEAKING each sentence as
+        it completes — no tool loop, no dead air."""
+        msgs = [{"role": "system", "content": _VOICE_SYSTEM}, *self.history,
+                {"role": "user", "content": text}]
+        state = self.state
+        target, model = self.target, self.model
+        pending: list[str] = []  # text since the last spoken sentence (executor thread only)
+        full: list[str] = []     # everything generated so far (for the answer frame)
+
+        def flush(force: bool = False):
+            # Called on the executor thread: peel off completed sentences, synth, ship.
+            buf = "".join(pending)
+            while True:
+                m = _re.search(r"[.!?][\"')\]]?\s", buf)
+                if m:
+                    sentence, buf = buf[:m.end()].strip(), buf[m.end():]
+                elif force and buf.strip():
+                    sentence, buf = buf.strip(), ""
+                else:
+                    break
+                if sentence and self.turn_id == my:
+                    self._synth_send_blocking(sentence, my)
+                if not buf:
+                    break
+            pending.clear()
+            pending.append(buf)
+
+        def on_content(tok: str):
+            if self.turn_id != my:
+                return
+            pending.append(tok)
+            full.append(tok)
+            # The UI replaces the answer text per frame — send the accumulated text
+            # so it grows live (per-token deltas would blank it).
+            asyncio.run_coroutine_threadsafe(
+                self._send({"type": "answer", "text": "".join(full)}), self.loop)
+            flush()
+
+        def work():
+            out = state.complete_stream(msgs, on_content=on_content, think=False,
+                                        target=target, model=model, engine=None)
+            flush(force=True)
+            return out
+
+        await self._send({"type": "status", "text": "thinking…"})
+        answer = await asyncio.wait_for(self.loop.run_in_executor(None, work), timeout=120)
+        if self.turn_id != my:
+            return
+        answer = (answer or "").strip()
+        if not answer:
+            raise RuntimeError("fast path produced no answer")
+        self._remember(text, answer)
+        await self._send({"type": "answer", "text": answer})
+        await self._send({"type": "done"})
+
+    def _synth_send_blocking(self, sentence: str, my: int):
+        """Synthesize one sentence and ship it (called from an executor thread).
+        Falls back to a browser-TTS `speak` frame if local TTS isn't available."""
+        try:
+            from .voice_provision import synthesize_pcm
+
+            if self.engine == "local":
+                pcm, sr = synthesize_pcm(sentence)
+                if self.turn_id == my:
+                    asyncio.run_coroutine_threadsafe(self._send({
+                        "type": "tts_audio",
+                        "pcm": base64.b64encode(pcm).decode("ascii"),
+                        "sr": sr,
+                    }), self.loop)
+                return
+        except Exception:  # noqa: BLE001 - fall through to browser TTS
+            pass
+        if self.turn_id == my:
+            asyncio.run_coroutine_threadsafe(
+                self._send({"type": "speak", "text": sentence}), self.loop)
+
+    async def _run_agent_turn(self, text: str, my: int):
         # A fresh cancel token for THIS turn, captured in the closure so a later turn
         # replacing self.cancel can't make us pass the wrong event into the executor.
         cancel = self.cancel = threading.Event()
-        await self._send({"type": "transcript", "text": text, "final": True})
         try:
             app = self._app()
         except Exception as exc:  # noqa: BLE001
             await self._send({"type": "error", "error": f"turn: {exc}"})
             return
 
+        # Speak an acknowledgment BEFORE the loop starts — a tool turn takes 10s+,
+        # and silent "thinking" is what makes voice mode feel broken.
+        await self.loop.run_in_executor(None, self._synth_send_blocking, _ack_for(text), my)
+        await self._send({"type": "status", "text": "working on it…"})
+
+        last_summary: list[str | None] = [None]
+
         def emit(frame):
             if self.turn_id != my:
                 return
             if "step" in frame:
+                obs = (frame["step"] or {}).get("observation")
+                if isinstance(obs, dict) and isinstance(obs.get("summary"), str):
+                    last_summary[0] = obs["summary"]
                 out = {"type": "step", "step": frame["step"]}
             elif "artifact" in frame:
                 out = {"type": "artifact", "artifact": frame["artifact"]}
@@ -254,7 +421,9 @@ class _Conn:
         if self.turn_id != my:
             return
         self.session_id = res.get("session_id", self.session_id)
-        answer = res.get("final_answer") or ""
+        # Never speak loop bookkeeping — prefer the last tool's human summary.
+        answer = _clean_answer(res.get("final_answer") or "", last_summary[0])
+        self._remember(text, answer)
         await self._send({"type": "answer", "text": answer})
         await self._speak(answer, my)
         await self._send({"type": "done"})
