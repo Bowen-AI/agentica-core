@@ -117,6 +117,47 @@ def voice_status() -> dict:
     }
 
 
+def selftest(phrase: str = "Agentica local voice self test, one two three.") -> dict:
+    """Prove the local STT+TTS pipeline works end-to-end, in-process (no renderer).
+
+    Synthesizes ``phrase`` with the active TTS engine, transcribes it back with
+    Whisper, and reports the round-trip. Never raises — collects errors instead,
+    so it can back a ``/api/voice/selftest`` health check and a CLI smoke test.
+    """
+    import numpy as np
+
+    out: dict = {
+        "ok": False, "stt_ok": False, "tts_ok": False,
+        "tts_engine": None, "sample_rate": None, "pcm_bytes": 0,
+        "duration_s": 0.0, "roundtrip_text": "", "errors": [],
+    }
+    out["tts_engine"] = voice_status().get("tts_engine")
+    pcm, sr = b"", 0
+    try:
+        pcm, sr = synthesize_pcm(phrase)
+        arr = np.frombuffer(pcm, dtype=np.int16)
+        out["sample_rate"] = sr
+        out["pcm_bytes"] = len(pcm)
+        out["duration_s"] = round(arr.size / float(sr), 2) if sr else 0.0
+        # Healthy audio = non-empty and not silence.
+        out["tts_ok"] = arr.size > 0 and int(np.abs(arr).max()) > 200
+        if not out["tts_ok"]:
+            out["errors"].append("TTS produced empty/silent audio")
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(f"TTS failed: {type(exc).__name__}: {exc}")
+    if pcm:
+        try:
+            text = transcribe_pcm16(pcm, sample_rate=sr or 24000)
+            out["roundtrip_text"] = text
+            out["stt_ok"] = bool(text and text.strip())
+            if not out["stt_ok"]:
+                out["errors"].append("STT produced no transcript")
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"STT failed: {type(exc).__name__}: {exc}")
+    out["ok"] = bool(out["stt_ok"] and out["tts_ok"])
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # STT — faster-whisper
 # --------------------------------------------------------------------------- #

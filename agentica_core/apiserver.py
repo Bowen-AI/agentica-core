@@ -44,7 +44,7 @@ from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, Mode
 from .on_node_runner import run_job
 from .transport import Transport
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +448,59 @@ def _add_model_option(options: list[dict], seen: set[tuple[str, str]], *,
     })
 
 
+# Cache the remote box's installed-model list briefly so /api/models doesn't SSH
+# on every keystroke/target-switch. Short TTL: a fresh pull should show up soon.
+_remote_models_cache: dict[str, tuple[float, list[str] | None]] = {}
+_REMOTE_MODELS_TTL = 30.0
+
+
+def remote_ollama_models(state: "State", target: str | None, timeout: float = 12.0) -> list[str] | None:
+    """The models ACTUALLY installed on a bare-SSH target's Ollama, or None if we
+    can't reach it (caller falls back to catalog presets). SLURM targets return
+    None — their models live on compute nodes, not the login node."""
+    key = (target or "").strip()
+    now = time.time()
+    hit = _remote_models_cache.get(key)
+    if hit and now - hit[0] < _REMOTE_MODELS_TTL:
+        return hit[1]
+    result = _remote_ollama_models_uncached(state, target, timeout)
+    _remote_models_cache[key] = (now, result)
+    return result
+
+
+def _remote_ollama_models_uncached(state: "State", target: str | None, timeout: float) -> list[str] | None:
+    try:
+        cluster = state.target_cluster(target)
+        if cluster is None or cluster.scheduler == "slurm":
+            return None
+        transport = Transport.from_cluster(cluster)
+        port = getattr(cluster.model, "serve_port", 11434) or 11434
+        # One round-trip: prefer a running server's /api/tags (JSON), else `ollama list`.
+        cmd = (f"curl -sf -m 5 http://127.0.0.1:{port}/api/tags 2>/dev/null "
+               f"|| ollama list 2>/dev/null")
+        res = transport.exec(cmd, timeout=timeout)
+        out = (getattr(res, "out", "") or "").strip()
+        if not out:
+            return None
+        if out.startswith("{"):  # JSON from /api/tags
+            data = json.loads(out)
+            models = (data or {}).get("models") or []
+            names = [m.get("name") or m.get("model") for m in models if isinstance(m, dict)]
+            return sorted({n for n in names if n})
+        # else parse the `ollama list` table: skip the NAME header, take col 1.
+        names = []
+        for i, line in enumerate(out.splitlines()):
+            parts = line.split()
+            if not parts:
+                continue
+            if i == 0 and parts[0].upper() == "NAME":
+                continue
+            names.append(parts[0])
+        return sorted(set(names))
+    except Exception:  # noqa: BLE001 - any failure -> "couldn't reach remote ollama"
+        return None
+
+
 def model_catalog_for_target(state: State, target: str | None) -> dict:
     t = (target or "local").strip() or "local"
     options: list[dict] = []
@@ -521,6 +574,21 @@ def model_catalog_for_target(state: State, target: str | None) -> dict:
                     catalog_key=key, fit="unchecked target fit",
                     note="Run discovery or add a cluster YAML GPU type for exact fit filtering.",
                 )
+
+    # Surface what's ACTUALLY installed on the box (bare-SSH targets): mark matching
+    # presets installed, and add any real models we didn't already list. This is the
+    # difference between "the UI guesses" and "the UI shows what the server has".
+    remote_installed = remote_ollama_models(state, t)
+    if remote_installed is not None:
+        for name in remote_installed:
+            _add_model_option(options, seen, model_id=name, engine="ollama",
+                              source="ollama", installed=True, fit="installed on this server")
+        if not remote_installed:
+            warning = ("Reached the server, but no Ollama models are installed yet — "
+                       "pick one below and click Download.")
+    else:
+        warning = warning or ("Couldn't reach this server's Ollama to list installed "
+                              "models; showing catalog presets you can download.")
     return {"target": t, "selected_model": selected, "selected_engine": selected_engine,
             "options": options, "warning": warning}
 
@@ -986,25 +1054,55 @@ def make_handler(state: State):
             self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-        def _stream_pull(self, model):
+        def _pull_loop(self, model, base_url):
+            """Stream ollama /api/pull progress SSE from base_url until success/error."""
+            req = urllib.request.Request(
+                base_url.rstrip("/") + "/api/pull",
+                data=json.dumps({"name": model, "stream": True}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=3600) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    self._sse(evt)
+                    if evt.get("status") == "success" or evt.get("error"):
+                        break
+
+        def _stream_pull(self, model, target=None):
             self._sse_start()
+            t = (target or "local").strip() or "local"
             try:
-                req = urllib.request.Request(
-                    state.ollama_host.rstrip("/") + "/api/pull",
-                    data=json.dumps({"name": model, "stream": True}).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST")
-                with urllib.request.urlopen(req, timeout=3600) as resp:
-                    for raw in resp:
-                        line = raw.decode("utf-8", "replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            evt = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        self._sse(evt)
-                        if evt.get("status") == "success" or evt.get("error"):
-                            break
+                if t == "local":
+                    self._pull_loop(model, state.ollama_host)
+                    self._sse({"done": True})
+                    return
+                # Remote target: pull on the box itself, over an ssh tunnel to its Ollama.
+                cluster = state.target_cluster(t)
+                if cluster is None:
+                    self._safe_sse({"error": f"unknown target {t}", "done": True})
+                    return
+                transport = Transport.from_cluster(cluster)
+                port = getattr(cluster.model, "serve_port", 11434) or 11434
+                self._safe_sse({"status": f"ensuring Ollama is running on {t}…"})
+                # Start ollama on the box if it isn't already serving (non-fatal).
+                transport.exec(
+                    f"curl -sf -m3 http://127.0.0.1:{port}/api/tags >/dev/null 2>&1 || "
+                    f"(nohup ollama serve >~/.agentica-ollama.log 2>&1 & sleep 2)",
+                    timeout=60)
+                local_port = _free_port()
+                self._safe_sse({"status": f"opening a secure tunnel to {t}…"})
+                with transport.tunnel(local_port, "127.0.0.1", port,
+                                      readiness_url=f"http://127.0.0.1:{local_port}/api/tags",
+                                      readiness_timeout_s=30) as tun:
+                    self._safe_sse({"status": f"downloading {model} on {t}…"})
+                    self._pull_loop(model, tun.base_url)
+                # Bust the installed-models cache so the UI flips to installed immediately.
+                _remote_models_cache.pop(t, None)
                 self._sse({"done": True})
             except Exception as exc:  # noqa: BLE001
                 self._safe_sse({"error": str(exc), "done": True})
@@ -1110,7 +1208,8 @@ def make_handler(state: State):
                 if u.path == "/api/setup":
                     return self._json(setup_status(state))
                 if u.path == "/api/model/pull":
-                    return self._stream_pull((q.get("model") or [state.model])[0])
+                    return self._stream_pull((q.get("model") or [state.model])[0],
+                                             (q.get("target") or ["local"])[0])
                 if u.path == "/api/models":
                     return self._json(model_catalog_for_target(
                         state, (q.get("target") or ["local"])[0],
@@ -1142,7 +1241,22 @@ def make_handler(state: State):
                     return self._json(self._job_logs(q))
                 if u.path == "/api/voice/status":
                     from .voice_provision import voice_status
-                    return self._json(voice_status())
+                    st = voice_status()
+                    th = getattr(state, "voice_thread", None)
+                    st["gateway_running"] = bool(th and th.is_alive())
+                    st["voice_ws_port"] = getattr(state, "voice_port", None)
+                    if not st["gateway_running"]:
+                        st["gateway_error"] = ("voice WebSocket gateway not running — "
+                                               "install 'websockets' (pip install websockets)")
+                    return self._json(st)
+                if u.path == "/api/voice/selftest":
+                    # End-to-end proof the local STT+TTS pipeline works, in-process.
+                    from .voice_provision import selftest
+                    st = selftest()
+                    th = getattr(state, "voice_thread", None)
+                    st["gateway_ok"] = bool(th and th.is_alive())
+                    st["voice_ws_port"] = getattr(state, "voice_port", None)
+                    return self._json(st)
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1321,7 +1435,10 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         print("  API auth: DISABLED (no AGENTICA_API_TOKEN) — dev/localhost only")
     # Full-duplex voice transport for the "local" voice engine (mic up / TTS down
     # + barge-in). Daemon thread; degrades to None if `websockets` isn't installed.
-    start_voice_gateway(state, host=host, port=port + 1)
+    # Capture the thread + port so /api/voice/status can report gateway health and
+    # the renderer can derive the WS port instead of hardcoding the +1 convention.
+    state.voice_port = port + 1
+    state.voice_thread = start_voice_gateway(state, host=host, port=port + 1)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     print(f"agentica-core API on http://{host}:{port}  (model={model}, ollama={ollama_host})")
     if state.clusters:
