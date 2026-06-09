@@ -44,7 +44,7 @@ from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, Mode
 from .on_node_runner import run_job
 from .transport import Transport
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 
 # --------------------------------------------------------------------------- #
@@ -1051,8 +1051,15 @@ def make_handler(state: State):
             self.end_headers()
 
         def _sse(self, obj):
-            self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
-            self.wfile.flush()
+            # Serialize writers: the agentic branch emits step frames from a worker
+            # thread while the handler thread emits keepalive pings — unguarded,
+            # the two can interleave mid-frame and corrupt the stream.
+            lock = getattr(self, "_sse_lock", None)
+            if lock is None:
+                lock = self._sse_lock = threading.Lock()
+            with lock:
+                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
+                self.wfile.flush()
 
         def _pull_loop(self, model, base_url):
             """Stream ollama /api/pull progress SSE from base_url until success/error."""
@@ -1159,12 +1166,38 @@ def make_handler(state: State):
                     # Stream per-step {step}/{artifact} frames as tools fire (the
                     # loop used to run monolithically -> a blank wait until done),
                     # then the authoritative terminal frame replaces them.
-                    res = stream_agent_turn(
-                        app, message, body.get("session_id"),
-                        emit=lambda frame: self._safe_sse(frame),
-                    )
-                    self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
-                               "session_id": res.get("session_id"), "done": True})
+                    # WATCHDOG: run the turn on a worker and heartbeat from here.
+                    # A frozen-build race once wedged this path with the client
+                    # seeing NOTHING forever — a turn may be slow, but the stream
+                    # must always be live and always end.
+                    box: dict = {}
+
+                    def _turn():
+                        try:
+                            box["res"] = stream_agent_turn(
+                                app, message, body.get("session_id"),
+                                emit=lambda frame: self._safe_sse(frame),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            box["err"] = exc
+
+                    worker = threading.Thread(target=_turn, daemon=True,
+                                              name="agentica-http-turn")
+                    worker.start()
+                    deadline = time.time() + 180
+                    while worker.is_alive() and time.time() < deadline:
+                        worker.join(2.0)
+                        if worker.is_alive():
+                            self._safe_sse({"ping": True})  # liveness; UI ignores it
+                    if worker.is_alive():
+                        self._safe_sse({"error": "the agent took too long and was stopped",
+                                        "done": True})
+                    elif "err" in box:
+                        self._safe_sse({"error": str(box["err"]), "done": True})
+                    else:
+                        res = box.get("res") or {}
+                        self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
+                                   "session_id": res.get("session_id"), "done": True})
             except Exception as exc:  # noqa: BLE001
                 self._safe_sse({"error": str(exc), "done": True})
 
