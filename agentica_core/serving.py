@@ -139,7 +139,10 @@ def bring_up_ssh(transport: Transport, cluster: ClusterConfig,
             f"(curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 || "
             f"(nohup ollama serve >~/.slurm-agentic/serve.log 2>&1 &)); "
             f"for i in $(seq 1 60); do curl -sf http://127.0.0.1:{p}/api/tags >/dev/null 2>&1 && break; sleep 1; done; "
-            f'ollama pull "{m.name}"'
+            # Pull the model and FAIL LOUDLY if it can't be fetched — otherwise chat
+            # dead-ends later with an opaque "model not found" from ollama.
+            f'ollama pull "{m.name}" || {{ echo "AGENTICA: could not pull \'{m.name}\' on this '
+            f'server (check the model name, disk space, or the box\'s network)" >&2; exit 1; }}'
         )
     else:
         setup = "; ".join(cluster.setup) + "; " if cluster.setup else ""
