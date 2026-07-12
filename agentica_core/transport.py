@@ -32,7 +32,9 @@ SSH_BASE_OPTS = [
     "-o", "ServerAliveInterval=15",
     "-o", "ControlMaster=auto",
     "-o", "ControlPath=~/.ssh/cm-slurm-agentic-%r@%h:%p",
-    "-o", "ControlPersist=120s",
+    # Long persistence: status polls + agent tool calls arrive for many minutes;
+    # re-dialing through a rate-limiting bastion is what gets connections dropped.
+    "-o", "ControlPersist=600s",
 ]
 SSH_TUNNEL_OPTS = [
     "-o", "ServerAliveInterval=15",
@@ -111,7 +113,7 @@ class Transport:
         if self.target is None:
             argv = ["bash", "-lc", command]
         else:
-            argv = [*self._ssh_prefix(), command]
+            argv = [*self._ssh_prefix(), f"bash -lc {shlex.quote(command)}"]
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout,
@@ -145,7 +147,13 @@ class Transport:
             if delete:
                 argv.append("--delete")
             argv += [src, dst]
-            return self.exec(argv)
+            try:
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+                if proc.returncode == 127 or "not found" in proc.stderr.lower():
+                    return self._tar_sync(src, dst, to_remote)
+                return ExecResult(proc.returncode, proc.stdout, proc.stderr)
+            except FileNotFoundError:
+                return self._tar_sync(src, dst, to_remote)
         ssh_cmd = " ".join(["ssh", *SSH_BASE_OPTS, *self._ssh_opts()])
         remote = self.target.target_str
         argv = ["rsync", "-az", "-e", ssh_cmd]
@@ -157,9 +165,66 @@ class Transport:
             argv += [f"{remote}:{src}", dst]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+            if proc.returncode == 127 or "not found" in proc.stderr.lower() or "rsync: command not found" in proc.stderr:
+                return self._tar_sync(src, dst, to_remote)
+            return ExecResult(proc.returncode, proc.stdout, proc.stderr)
+        except FileNotFoundError:
+            return self._tar_sync(src, dst, to_remote)
         except subprocess.TimeoutExpired as exc:
             raise TransportError("rsync timed out") from exc
-        return ExecResult(proc.returncode, proc.stdout, proc.stderr)
+
+    def _tar_sync(self, src: str, dst: str, to_remote: bool) -> ExecResult:
+        import os
+        src_dir = src.rstrip("/")
+        dst_dir = dst.rstrip("/")
+        if self.target is None:
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+                p_local_src = subprocess.Popen(["tar", "-cf", "-", "-C", src_dir, "."], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_local_dst = subprocess.Popen(["tar", "-xf", "-", "-C", dst_dir], stdin=p_local_src.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_local_src.stdout.close()
+                out_dst, err_dst = p_local_dst.communicate()
+                _, err_src = p_local_src.communicate()
+                p_local_src.wait()
+                rc = p_local_dst.returncode
+                err_msg = (err_src.decode("utf-8", "replace") + "\n" + err_dst.decode("utf-8", "replace")).strip()
+                return ExecResult(rc, out_dst.decode("utf-8", "replace"), err_msg)
+            except Exception as exc:
+                return ExecResult(1, "", f"local tar copy failed: {exc}")
+
+        if to_remote:
+            remote_cmd = f"mkdir -p {shlex.quote(dst_dir)} && tar -xzf - -C {shlex.quote(dst_dir)}"
+            remote_argv = [*self._ssh_prefix(), f"bash -lc {shlex.quote(remote_cmd)}"]
+            local_argv = ["tar", "-czf", "-", "-C", src_dir, "."]
+            try:
+                p_local = subprocess.Popen(local_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_remote = subprocess.Popen(remote_argv, stdin=p_local.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_local.stdout.close()
+                out_rem, err_rem = p_remote.communicate()
+                _, err_loc = p_local.communicate()
+                p_local.wait()
+                rc = p_remote.returncode
+                err_msg = (err_loc.decode("utf-8", "replace") + "\n" + err_rem.decode("utf-8", "replace")).strip()
+                return ExecResult(rc, out_rem.decode("utf-8", "replace"), err_msg)
+            except Exception as exc:
+                return ExecResult(1, "", f"tar push failed: {exc}")
+        else:
+            remote_cmd = f"tar -czf - -C {shlex.quote(src_dir)} ."
+            remote_argv = [*self._ssh_prefix(), f"bash -lc {shlex.quote(remote_cmd)}"]
+            local_argv = ["tar", "-xzf", "-", "-C", dst_dir]
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+                p_remote = subprocess.Popen(remote_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_local = subprocess.Popen(local_argv, stdin=p_remote.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p_remote.stdout.close()
+                out_loc, err_loc = p_local.communicate()
+                _, err_rem = p_remote.communicate()
+                p_remote.wait()
+                rc = p_local.returncode
+                err_msg = (err_rem.decode("utf-8", "replace") + "\n" + err_loc.decode("utf-8", "replace")).strip()
+                return ExecResult(rc, out_loc.decode("utf-8", "replace"), err_msg)
+            except Exception as exc:
+                return ExecResult(1, "", f"tar pull failed: {exc}")
 
     # -- SLURM helpers (run on the login node) --
     def sbatch(self, script_path: str, args: Sequence[str] = ()) -> str:

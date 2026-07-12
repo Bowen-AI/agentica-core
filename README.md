@@ -1,90 +1,166 @@
 # agentica-core
 
-> Backend/runtime for the [Agentica](../Agentica) UI. The Python package is
-> `agentica_core` and the CLI is `agentica` (`slurm-agentic` remains a back-compat alias).
+Backend and runtime for the [Agentica desktop app](../Agentica): open-weight,
+tool-using agents on local, SSH, and SLURM machines. The Python package is
+`agentica_core`; the CLI is `agentica` (`slurm-agentic` remains as a compatibility
+alias). It is built on [AgenticLocal](../AgenticLocal)'s model + state + tools +
+policy loop.
 
-Run **open-weight agentic AI + chat on local, SSH, or SLURM targets** described by a
-`cluster.yaml` or a bare `~/.ssh/config` alias. Built on [AgenticLocal](../AgenticLocal)'s
-`agentic_loop` engine (`agent = model + state + tools + policy loop`).
+## Install and run locally
 
-## Agentica UI + JSON API
+Requirements: Python 3.11+, Ollama, and a sibling AgenticLocal checkout.
 
-[Agentica](../Agentica) (React + Vite) is the unified **agentic + chat** console with
-a **plan editor** (per-line edit + comments → refine → submit). It talks to this
-backend's JSON API:
+```sh
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -e ../AgenticLocal
+pip install -e ".[voice]"       # use `-e .` for typed-only operation
 
-```
-agentica serve-api                            # http://127.0.0.1:8770/api/* (model defaults to qwen3.5:4b-mlx)
-#   GET  /api/hosts            local + every ~/.ssh/config server + configured clusters
-#   POST /api/chat             {message, mode: agentic|plain, workspace?}
-#   POST /api/plan/draft       {goal}            -> editable plan lines + tests
-#   POST /api/plan/refine      {plan, comments}  -> revised plan
-#   POST /api/job/submit       {plan, target}    -> local thread OR ssh/SLURM sbatch
-#   GET  /api/job/status|logs
+agentica serve-api --clusters-dir ~/.config/agentica/clusters
+# HTTP/SSE API: http://127.0.0.1:8770
+# local voice WS: ws://127.0.0.1:8771
 ```
 
-**SLURM from the UI.** Drop `cluster.yaml` files (with `account`/`partition`/`setup`)
-into `~/.config/agentica/clusters/` (or pass `--clusters-dir DIR` / set
-`$AGENTICA_CLUSTERS_DIR`) and they appear as selectable job targets in the UI's target
-picker — so a job submitted from the app carries the full SLURM config, not just a bare
-ssh alias. Plain `~/.ssh/config` aliases remain available for non-SLURM GPU boxes.
+The desktop API is agentic-only: every Chat and Voice request runs the tool loop.
 
-The two CLI modes below still work standalone:
+## One request, two machines
 
-1. **Interactive gateway** — a localhost ChatGPT-like web chat + an OpenAI-compatible
-   `/v1` API (for VS Code / Continue / Cline), backed by a model served on a remote
-   GPU node reached over an SSH tunnel. The agent loop runs locally; only inference
-   is remote.
-2. **Agentic job** — submit a `plan.yaml` to SLURM as a batch job that drives a
-   **Planner → Executor → Auditor** loop to completion, with deterministic
-   test/artifact backstops the model can't override.
+Model inference and workspace tools are independent:
 
-```
-pip install -e .            # also: pip install -e ../AgenticLocal
-slurm-agentic up examples/cluster.yaml                 # web chat + /v1 backed by the cluster
-slurm-agentic job submit examples/cluster.yaml examples/plans/code_experiment.yaml
-```
+- `target` is the **model machine**. It loads the selected Ollama or vLLM model.
+- `workspace_target` is the **workspace machine**. File and shell tools execute
+  inside `workspace` on this machine and default to `local`.
 
-## Target any server in your ~/.ssh/config
+This lets a large model run on an SSH GPU server while it edits a repository on
+your laptop. Set both targets to the same SSH alias to work directly in a remote
+checkout.
 
-The cluster target can be a full `cluster.yaml` **or a bare ssh alias** — connection
-(HostName, User, Port, IdentityFile, **ProxyJump hops**, ForwardAgent) is inherited
-from your `~/.ssh/config`, so nothing is duplicated. SLURM clusters and plain GPU
-boxes are auto-detected (`scheduler: auto` → probes for `sbatch`).
-
-```
-slurm-agentic hosts                          # list servers from ~/.ssh/config
-slurm-agentic discover discovery.usc.edu     # probe scheduler + partitions + GPUs -> draft yaml
-slurm-agentic up syrah                        # plain GPU box (no SLURM): ollama over ssh + tunnel
-slurm-agentic job submit examples/discovery.yaml examples/plans/discovery_smoke.yaml
+```json
+POST /api/chat
+{
+  "message": "Inspect the failing API test, fix it, and run that test.",
+  "target": "gpu-box",
+  "model": "qwen3.5:9b",
+  "workspace": "/Users/me/code/project",
+  "workspace_target": "local"
+}
 ```
 
-For a multi-hop cluster, either rely on the `ProxyJump` in your ssh config, or set
-`ssh: { host: <alias>, proxy_jump: <bastion> }` in the yaml. `setup:` lines (e.g.
-`module load ...`, putting a user-space ollama on `PATH`) run at the top of every
-sbatch on the compute node — see [examples/discovery.yaml](examples/discovery.yaml).
+Hosts come from `~/.ssh/config`; full cluster definitions come from
+`~/.config/agentica/clusters/*.yaml` (or `--clusters-dir`). ProxyJump, ports,
+identity files, accounts, partitions, setup commands, and GPU requests stay in
+those existing configurations.
 
-### Verified on a real cluster (USC CARC Discovery)
+## Desktop API
 
-Run end-to-end on **Discovery** (SLURM 25.05) over the `~/.ssh/config` alias, with a
-rootless Ollama staged on `/scratch1` (no admin) and `llama3.2:3b`:
+```text
+GET  /api/hosts
+GET  /api/models?target=local
+POST /api/chat                 agentic turn; no plain-chat mode
+POST /api/chat/stream          SSE tool steps, artifacts, and final answer
+GET  /api/history?session_id=…
+GET  /api/sessions
+POST /api/sessions/delete
 
+POST /api/plan/draft           model/workspace targets are independent
+POST /api/plan/refine
+POST /api/job/submit           local thread, SSH process, or SLURM job
+GET  /api/job/status
+GET  /api/job/logs
+POST /api/job/cancel
+POST /api/job/fetch            sync a staged workspace back
+
+GET  /api/voice/status
+POST /api/voice/install
 ```
-slurm-agentic discover discovery.usc.edu
-#  scheduler: slurm · partitions: [debug, gpu, main, ...] · gpu_types: [a100, a40, l40s, p100, v100]
 
-slurm-agentic job submit examples/discovery_debug.yaml examples/plans/discovery_smoke.yaml
-#  [submitted] job_id=9210485
-slurm-agentic job status examples/discovery_debug.yaml --job 9210485 --jobdir <...>
-#  job 9210485: state=COMPLETED · result: passed=True iterations=1 tests_ok=True
+Set `AGENTICA_AUTH_TOKEN` to require the same local bearer token used by the
+packaged Electron app.
+
+## Local voice, optimized for response time
+
+Voice never needs a browser speech API or a cloud provider:
+
+```text
+microphone → Silero VAD → Whisper → agent loop + tools → Kokoro → speakers
 ```
 
-On a40 node `b11-09` the on-node Planner→Executor→Auditor loop wrote `hello.txt`
-("hello from discovery") and the deterministic `grep` backstop passed — a real
-agentic job carried to completion on the cluster. (Lesson baked into the config:
-the old **P100 is too slow** for the default 120s request timeout — raise
-`model.timeout_s`, or use a40/a100/l40s. The busy `gpu` queue was ~6h out, so the
-short `debug`-partition job backfilled in seconds.)
+- Apple Silicon automatically prefers `mlx-whisper` `small.en` on Metal.
+- Other platforms use `faster-whisper` `base.en` with CPU int8.
+- Kokoro is the default open-weight TTS; Piper is a small fallback when present.
+- The gateway warms cached models in a background thread so the first live turn
+  does not also pay model construction time.
+- Weights are downloaded on first use under
+  `~/.local/share/agentica/voice`. Override that with `AGENTICA_VOICE_HOME`.
+
+Useful controls:
+
+```sh
+agentica voice-status
+agentica voice-selftest
+
+AGENTICA_STT_ENGINE=mlx agentica serve-api       # Apple Silicon + Metal
+AGENTICA_STT_ENGINE=faster agentica serve-api    # portable CPU path
+AGENTICA_WHISPER_MODEL=tiny.en agentica serve-api
+python scripts/bench_voice.py                    # cold/warm STT + TTS timings
+```
+
+The app stores Voice history as user/assistant text only. Raw microphone audio is
+processed in memory and is not added to history.
+
+## Parallel tracked jobs
+
+Each UI submission is an independent run. Submit the same plan to multiple
+workers and the app monitors them concurrently, records logs and output, supports
+cancellation, and keeps polling when the user changes views.
+
+A remote run has two workspace modes:
+
+- `workspace_source: "local"` stages a snapshot in the job directory. The API
+  returns `sync_to`, and `/api/job/fetch` copies completed output back.
+- `workspace_source: "remote"` operates in an existing path on the worker. For
+  SLURM, that path must be visible from the compute node.
+
+The plan-file CLI exposes the same choice with a workspace prefix:
+
+```yaml
+# Snapshot a folder from the submission machine:
+workspace: local:./examples/plans/ws_retry
+
+# Or modify an existing checkout on the selected worker:
+workspace: remote:~/work/my-project
+```
+
+```sh
+agentica job submit gpu-box examples/plans/retry_backoff.yaml
+agentica job status gpu-box --job <id> --jobdir <dir>
+agentica job logs gpu-box --job <id> --jobdir <dir>
+agentica job cancel gpu-box --job <id>
+agentica job fetch gpu-box --jobdir <dir> --out job-artifacts
+```
+
+For a local worker, the job runs in a background thread. For a plain SSH worker,
+it runs as a recorded remote process group. For a SLURM target, it submits with
+`sbatch`; status and cancellation use the scheduler.
+
+## Target any SSH host or SLURM cluster
+
+```sh
+agentica hosts
+agentica discover discovery.usc.edu
+agentica up examples/cluster.yaml --v1-mode agentic
+agentica fit qwen3-235b-a22b a100-80 --count 2 --quant int4
+agentica library --gpu l40s
+```
+
+`scheduler: auto` probes for `sbatch`, so a bare SSH GPU box and a cluster alias
+use the same high-level workflow. `setup:` lines in cluster YAML run before model
+startup; see [examples/discovery.yaml](examples/discovery.yaml).
+
+The repository has also been exercised end to end on USC CARC Discovery with a
+rootless Ollama install and deterministic test/artifact backstops. Cluster queues,
+model availability, and hardware change, so treat the example configs as starting
+points rather than current capacity claims.
 
 ## Model deployment / GPU sizing
 
@@ -118,20 +194,27 @@ agentica_core/
   catalog.py       GPU+model catalog, preflight_fit(), validated preset library
   transport.py     sync ssh/scp/rsync + sbatch/squeue/scancel + tunnel ctx mgr
   serving.py       bring up ollama/vLLM on a node, readiness, preflight
-  gateway.py       Mode 1: web chat + /v1 (passthrough|agentic) + Bearer auth
-  webchat.py       ChatGPT-like browser page (history + copy-API)
+  apiserver.py     agentic desktop API, history, planning, jobs, model routing
+  gateway.py       model/workspace split, tool registry, optional /v1 gateway
+  voice_gateway.py local agentic voice WebSocket
+  voice_provision.py  MLX/faster Whisper + Kokoro/Piper provisioning
   slurm_tools.py   run_shell/run_tests/check_artifact/submit_for_audit/generate_*
   workflows.py     Planner/Executor/Auditor workflows (seeded into the registry)
   on_node_runner.py  Mode 2 auditor outer loop (runs inside the SLURM job)
-  job.py           Mode 2: submit/status/logs/cancel/fetch
-  cli.py           `slurm-agentic` entrypoint
+  job.py           local/SSH/SLURM submit, status, logs, cancel, fetch
+  cli.py           `agentica` entrypoint
 ```
 
 ## Testing without a cluster
 
-`tests/` runs fully offline: `Transport.local()` + fake `sbatch`/`squeue` shims,
-the `rule`/scripted model through the auditor loop, the preset-library fit check,
-and the workflow-resolution regression. Run: `python -m pytest tests/ -q`.
+`tests/` uses local transports and fake SSH/SLURM shims for most coverage. Run:
+
+```sh
+python -m pytest tests -q
+```
+
+Tests that intentionally resolve public network names may be skipped in a
+network-restricted environment.
 
 <!-- BENCH:START -->
 ## Benchmark (online e2e)

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentica-core"
-version = "0.2.3"
-description = "Backend/runtime for Agentica: open-weight agentic AI + chat on local, SSH, or SLURM targets."
+version = "0.3.0"
+description = "Local-first runtime for agentic chat, voice, and parallel local, SSH, or SLURM jobs."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "agentica-core" }]
@@ -30,6 +30,9 @@ dependencies = [
 # binary fetched at runtime by voice_provision, not a Python dependency.
 voice = [
   "faster-whisper>=1.0",
+  # Apple-Silicon GPU STT: same-latency small.en beats CPU base.en on accuracy
+  # (see voice_provision; AGENTICA_STT_ENGINE overrides the auto-pick).
+  "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "kokoro-onnx>=0.4",
   "soundfile>=0.12",
 ]

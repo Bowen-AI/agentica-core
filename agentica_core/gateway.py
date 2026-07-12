@@ -5,7 +5,7 @@ events) and adds, in our own request handler:
 
 * a ChatGPT-like web chat page at ``/`` (history + copy-API button),
 * an OpenAI-compatible ``/v1/chat/completions`` + ``/v1/models`` for VS Code
-  (PASSTHROUGH to the remote engine by default; AGENTIC mode wraps the loop),
+  (every request runs the agent loop; there is no plain model passthrough),
 * optional Bearer-token auth.
 
 AgenticLocal itself is left untouched -- the model adapter is simply pointed at
@@ -15,25 +15,26 @@ AgenticLocal itself is left untouched -- the model adapter is simply pointed at
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import tempfile
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
-import urllib.error
-import urllib.request
-
 from agentic_loop.model_selection import ModelSelection
 from agentic_loop.server import AgentServerApp
-from agentic_loop.tools import create_default_tools
+from agentic_loop.tools import Tool, ToolContext, ToolRegistry, create_default_tools, inspect_csv
 
 from .config import ClusterConfig
+from . import __version__
 from . import serving
 from .transport import Transport, TransportError
 from .voice_tools import register_voice_tools
 from .webchat import chat_page_html
-
-__version__ = "0.2.3"
-
 
 # --------------------------------------------------------------------------- #
 # Gateway HTTP server
@@ -47,7 +48,12 @@ def make_gateway_handler(
     model_label: str,
     public_api_base: str,
 ):
-    """Build a request handler that delegates to ``app`` and adds /v1 + auth + chat UI."""
+    """Build the agentic gateway handler.
+
+    ``remote_v1_base`` and ``v1_mode`` remain accepted for callers from older
+    releases.  They no longer select a plain proxy: even the legacy
+    ``v1_mode='passthrough'`` value is an agentic compatibility alias.
+    """
 
     class GatewayHandler(BaseHTTPRequestHandler):
         server_version = f"agentica-core/{__version__}"
@@ -127,38 +133,7 @@ def make_gateway_handler(
 
         # -- /v1 translation --
         def _handle_v1(self, body: dict):
-            stream = bool(body.get("stream"))
-            requested = str(body.get("model") or "")
-            agentic = v1_mode == "agentic" or requested.lower() in {"agentic", "agent"}
-            if agentic:
-                self._v1_agentic(body, stream)
-            else:
-                self._v1_passthrough(body, stream)
-
-        def _v1_passthrough(self, body: dict, stream: bool):
-            """Proxy straight to the remote engine's /v1 (best for VS Code: real streaming)."""
-            url = remote_v1_base.rstrip("/") + "/chat/completions"
-            payload = dict(body)
-            payload.setdefault("model", model_label)
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(url, data=data,
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    self.send_response(resp.status)
-                    ctype = resp.headers.get("Content-Type", "application/json")
-                    self.send_header("Content-Type", ctype)
-                    self.end_headers()
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-            except urllib.error.HTTPError as exc:
-                self._json({"error": "upstream", "status": exc.code,
-                            "message": exc.read().decode("utf-8", "replace")}, status=502)
-            except urllib.error.URLError as exc:
-                self._json({"error": "upstream_unreachable", "message": str(exc.reason)}, status=502)
+            self._v1_agentic(body, bool(body.get("stream")))
 
         def _v1_agentic(self, body: dict, stream: bool):
             """Run the full agent loop and return its final answer in OpenAI shape."""
@@ -245,11 +220,241 @@ def _load_history(app: AgentServerApp, session_id: str) -> list[dict]:
     return [{"role": m.role, "content": m.content} for m in msgs if m.role in {"user", "assistant"}]
 
 
+_SHELL_DENYLIST = ("rm -rf /", "shutdown", "mkfs", ":(){", "/etc/passwd")
+
+
+def _validate_shell_command(command: str) -> None:
+    if not command:
+        raise ValueError("run_shell requires a non-empty 'command'")
+    lower = command.lower()
+    for token in _SHELL_DENYLIST:
+        if token in lower:
+            raise PermissionError(f"run_shell blocked: command contains disallowed token {token!r}")
+
+
+def _register_run_shell(registry: ToolRegistry, handler, *, location: str) -> ToolRegistry:
+    if "run_shell" not in registry.names():
+        registry.register(Tool(
+            name="run_shell",
+            description=f"Run a shell command in the {location} workspace and return exit code + output.",
+            parameters={"type": "object", "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "number", "default": 300.0},
+            }, "required": ["command"]},
+            handler=handler,
+            risk_level="high",
+            source="job",
+        ))
+    return registry
+
+
+def create_local_tools(*, enable_network: bool = True) -> ToolRegistry:
+    """Code-capable tools whose file and shell operations stay in ToolContext.workspace_root."""
+    registry = create_default_tools(enable_network=enable_network)
+
+    def local_run_shell(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        command = (arguments.get("command") or arguments.get("cmd") or "").strip()
+        _validate_shell_command(command)
+        timeout = float(arguments.get("timeout", 300.0))
+        root = context.workspace_root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", command], cwd=str(root), capture_output=True, text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {"command": command, "exit_code": 124, "stdout": exc.stdout or "",
+                    "stderr": f"timeout after {timeout}s", "timed_out": True}
+        return {"command": command, "exit_code": proc.returncode,
+                "stdout": proc.stdout[-8000:], "stderr": proc.stderr[-4000:],
+                "timed_out": False}
+
+    return _register_run_shell(registry, local_run_shell, location="local")
+
+
+_REMOTE_LIST = """
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).expanduser().resolve()
+root.mkdir(parents=True, exist_ok=True)
+requested = (root / sys.argv[2]).resolve()
+if requested != root and root not in requested.parents:
+    raise PermissionError(f"path escapes workspace: {sys.argv[2]}")
+if not requested.exists():
+    raise FileNotFoundError(sys.argv[2])
+if not requested.is_dir():
+    raise NotADirectoryError(sys.argv[2])
+files = [str(path.relative_to(root)) for path in sorted(requested.rglob("*")) if path.is_file()]
+print(json.dumps({"files": files}))
+"""
+
+_REMOTE_READ = """
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).expanduser().resolve()
+target = (root / sys.argv[2]).resolve()
+if target != root and root not in target.parents:
+    raise PermissionError(f"path escapes workspace: {sys.argv[2]}")
+if not target.is_file():
+    raise FileNotFoundError(sys.argv[2])
+limit = int(sys.argv[3])
+content = target.read_text(encoding="utf-8")
+print(json.dumps({"content": content[:limit], "truncated": len(content) > limit}))
+"""
+
+_REMOTE_RESOLVE = """
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).expanduser().resolve()
+root.mkdir(parents=True, exist_ok=True)
+target = (root / sys.argv[2]).resolve()
+if target != root and root not in target.parents:
+    raise PermissionError(f"path escapes workspace: {sys.argv[2]}")
+if sys.argv[3] == "write":
+    target.parent.mkdir(parents=True, exist_ok=True)
+elif not target.is_file():
+    raise FileNotFoundError(sys.argv[2])
+print(json.dumps({"root": str(root), "target": str(target)}))
+"""
+
+
+def _python_command(source: str, *args: object) -> str:
+    """Build a shell-safe command while keeping user-controlled values out of Python source."""
+    return " ".join(["python3", "-c", shlex.quote(source),
+                     *(shlex.quote(str(arg)) for arg in args)])
+
+
+def _remote_json(transport: Transport, what: str, source: str, *args: object) -> dict:
+    result = transport.exec(_python_command(source, *args))
+    if result.rc == 255:
+        # rc=255 is ssh itself failing (a rate-limiting bastion dropping the
+        # dial), not the remote script. These reads are idempotent — retry once
+        # after a beat instead of failing the agent's whole tool call.
+        time.sleep(2.0)
+        result = transport.exec(_python_command(source, *args))
+    result.check(what)
+    try:
+        value = json.loads(result.out)
+    except json.JSONDecodeError as exc:
+        raise TransportError(f"{what} returned invalid JSON: {result.out[:200]!r}") from exc
+    if not isinstance(value, dict):
+        raise TransportError(f"{what} returned a non-object response")
+    return value
+
+
+def create_remote_tools(
+    target: str,
+    remote_workspace: str,
+    *,
+    transport: Transport | None = None,
+) -> ToolRegistry:
+    """Code tools backed by an SSH transport, with an injectable transport for tests."""
+    if transport is None:
+        cluster = ClusterConfig.resolve(target)
+        transport = Transport.from_cluster(cluster)
+
+    registry = ToolRegistry()
+
+    def remote_list_files(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = str(arguments.get("path", "."))
+        payload = _remote_json(transport, "remote list_files", _REMOTE_LIST,
+                               remote_workspace, path)
+        return {"path": path, "files": payload.get("files", [])}
+
+    def remote_read_file(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = str(arguments["path"])
+        max_chars = max(0, int(arguments.get("max_chars", 12000)))
+        payload = _remote_json(transport, "remote read_file", _REMOTE_READ,
+                               remote_workspace, path, max_chars)
+        return {"path": path, "content": str(payload.get("content", "")),
+                "truncated": bool(payload.get("truncated"))}
+
+    def _resolve(path: str, mode: str) -> dict:
+        return _remote_json(transport, "resolve remote path", _REMOTE_RESOLVE,
+                            remote_workspace, path, mode)
+
+    def remote_write_file(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = str(arguments["path"])
+        content = str(arguments.get("content", ""))
+        remote_target = str(_resolve(path, "write")["target"])
+        fd, temp_path = tempfile.mkstemp()
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            transport._rsync(temp_path, remote_target, to_remote=True, delete=False).check("push file")
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return {"path": path, "bytes_written": len(content.encode("utf-8"))}
+
+    def remote_inspect_csv(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = str(arguments["path"])
+        remote_target = str(_resolve(path, "read")["target"])
+        fd, temp_path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            transport._rsync(remote_target, temp_path, to_remote=False, delete=False).check("pull csv file")
+            dummy_ctx = ToolContext(workspace_root=Path(temp_path).parent)
+            result = inspect_csv(dummy_ctx, {"path": Path(temp_path).name})
+            result["path"] = path
+            return result
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    def remote_run_shell(context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        command = (arguments.get("command") or arguments.get("cmd") or "").strip()
+        _validate_shell_command(command)
+        timeout = float(arguments.get("timeout", 300.0))
+        root = str(_resolve(".", "write")["root"])
+        try:
+            result = transport.exec(f"cd -- {shlex.quote(root)} && {command}", timeout=timeout)
+        except TransportError as exc:
+            return {"command": command, "exit_code": 124, "stdout": "",
+                    "stderr": str(exc), "timed_out": True}
+        return {"command": command, "exit_code": result.rc,
+                "stdout": result.out[-8000:], "stderr": result.err[-4000:],
+                "timed_out": False}
+
+    registry.register(Tool(
+        name="list_files", description="List files inside the remote workspace.",
+        parameters={"type": "object", "properties": {"path": {"type": "string", "default": "."}}, "required": []},
+        handler=remote_list_files, risk_level="low", ui_component_hint="file_browser"))
+    registry.register(Tool(
+        name="read_file", description="Read a text file inside the remote workspace.",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer", "default": 12000}}, "required": ["path"]},
+        handler=remote_read_file, risk_level="low", ui_component_hint="text_preview"))
+    registry.register(Tool(
+        name="write_file", description="Write a text file under the configured remote workspace.",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+        handler=remote_write_file, risk_level="medium", ui_component_hint="file_writer"))
+    registry.register(Tool(
+        name="inspect_csv", description="Inspect a CSV file inside the remote workspace.",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        handler=remote_inspect_csv, risk_level="low", ui_component_hint="table_preview"))
+    _register_run_shell(registry, remote_run_shell, location="remote")
+
+    default_registry = create_default_tools(enable_network=True)
+    for name in ("remember", "recall", "current_datetime", "search_web", "search_news", "fetch_url"):
+        if name in default_registry._tools:
+            registry.register(default_registry._tools[name])
+    return registry
+
+
 def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str,
               auth_token: str | None, system_prompt: str | None = None,
               provider: str = "ollama", api_base: str | None = None,
-              api_key: str | None = None) -> AgentServerApp:
-    """Construct an AgentServerApp whose model adapter points at the selected runtime."""
+              api_key: str | None = None, tools_target: str | None = None,
+              target: str | None = None) -> AgentServerApp:
+    """Construct an app with model hosting and tool execution independently selectable.
+
+    ``tools_target`` controls only file/shell placement. ``target`` remains a
+    compatibility alias for callers written before that split; new callers should
+    never derive ``tools_target`` from the inference target implicitly.
+    """
+    effective_tools_target = tools_target if tools_target is not None else (target or "local")
     kwargs = dict(
         workspace=workspace,
         db_path=db_path,
@@ -258,7 +463,9 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
         ollama_host=ollama_host,
         api_base=api_base,
         api_key=api_key,
-        write_roots=["outputs"],
+        # Selecting a workspace explicitly authorizes code edits throughout it.
+        # WorkspacePolicy still confines paths to this root.
+        write_roots=["."],
         enable_network_tools=True,
     )
 
@@ -266,7 +473,11 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
     # via the AgentServerApp tools_factory hook -- kept in agentica-core so the
     # release never needs them in AgenticLocal's git main.
     def _tools_factory():
-        return register_voice_tools(create_default_tools(enable_network=True))
+        if effective_tools_target and effective_tools_target != "local":
+            registry = create_remote_tools(effective_tools_target, workspace)
+        else:
+            registry = create_local_tools(enable_network=True)
+        return register_voice_tools(registry)
 
     # Pass tools_factory + system_prompt, degrading on an older engine that
     # lacks either kwarg (a release that pip-installs an older AgenticLocal).
@@ -302,7 +513,7 @@ def up(
     model_override: str | None = None,
     workspace: str = "sample_workspace",
     db_path: str = ".agentic/agentic.db",
-    v1_mode: str = "passthrough",
+    v1_mode: str = "agentic",
     skip_preflight: bool = False,
     serve_wait_s: float = 600.0,
     _print=print,
@@ -378,7 +589,7 @@ def _serve_local(cluster, ollama_host, remote_v1_base, model_name, workspace, db
     server = run_gateway_server(handler, host, port)
     _print("")
     _print(f"  web chat:     http://{host}:{port}/")
-    _print(f"  OpenAI API:   {public_api_base}   (model: {model_name}, mode: {v1_mode})")
+    _print(f"  OpenAI API:   {public_api_base}   (model: {model_name}, mode: agentic)")
     _print(f"  API token:    {token or '(none — open access)'}")
     _print(f"  VS Code:      set apiBase={public_api_base} apiKey={token or 'sk-none'} model={model_name}")
     if on_exit_note:
