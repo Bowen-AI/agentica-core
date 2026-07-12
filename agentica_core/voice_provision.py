@@ -454,8 +454,9 @@ def install_voice(progress=lambda m: None) -> bool:
         progress(f"STT engine: {'mlx-whisper (Apple GPU)' if engine == 'mlx' else 'faster-whisper (CPU)'}")
         try:
             progress("fetching the speech-recognition model (first time only)…")
-            import numpy as np
-            transcribe_pcm16(np.zeros(1600, dtype=np.int16).tobytes(), 16000)
+            # 0.1 s of PCM16 silence. Keep provisioning independent of NumPy:
+            # the selected STT implementation owns any array conversion it needs.
+            transcribe_pcm16(b"\0" * 3200, 16000)
             progress("speech-recognition model ready")
         except Exception as exc:  # noqa: BLE001
             progress(f"speech model fetch failed: {exc}")
