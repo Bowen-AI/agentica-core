@@ -1,22 +1,26 @@
-"""Local speech-to-text (Whisper) and text-to-speech (Piper) for voice mode.
+"""Local speech-to-text (Whisper) and text-to-speech (Kokoro/Piper) for voice mode.
 
 Mirrors the rootless-Ollama pattern in apiserver: heavy assets live OUTSIDE the
 ~110MB app bundle, under ``~/.local/share/agentica/voice``, and download on first
-use. Everything here degrades gracefully: if faster-whisper / Piper aren't
-installed or provisioned, the functions raise ``VoiceUnavailable`` and the voice
-gateway falls back to the browser / text path instead of crashing.
+use. Everything here degrades gracefully: if the STT/TTS deps aren't installed
+or provisioned, the functions raise ``VoiceUnavailable`` and the voice gateway
+reports it (typed turns keep working) instead of crashing.
 
-STT: faster-whisper (CTranslate2) — a pip wheel, models auto-download from HF.
-TTS: Piper — a native binary + a per-voice .onnx model, streams raw PCM.
+STT engines (AGENTICA_STT_ENGINE = auto|mlx|faster, default auto):
+  * mlx-whisper   — Whisper on the Apple-Silicon GPU (Metal). Measurably faster
+                    than CPU decoding on M-series; preferred when importable.
+  * faster-whisper — CTranslate2 int8 on CPU. Portable default everywhere else.
+TTS: Kokoro (kokoro-onnx, natural open-weight voice) with a Piper fallback.
 """
 
 from __future__ import annotations
 
-import json
+import functools
 import os
 import shutil
 import subprocess
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -30,7 +34,29 @@ WHISPER_DIR = VOICE_HOME / "whisper"
 PIPER_DIR = VOICE_HOME / "piper"
 KOKORO_DIR = VOICE_HOME / "kokoro"
 
-DEFAULT_WHISPER_MODEL = os.environ.get("AGENTICA_WHISPER_MODEL", "base.en")
+# Whisper size is engine-aware unless pinned via AGENTICA_WHISPER_MODEL:
+# benchmarked on an M-series Mac (Kokoro-synthesized utterances), mlx small.en
+# decodes in ~0.26s/utterance — the same latency the old CPU base.en int8 paid —
+# with a full model-size accuracy jump; base.en stays the CPU default.
+_WHISPER_MODEL_ENV = os.environ.get("AGENTICA_WHISPER_MODEL")
+DEFAULT_WHISPER_MODEL = _WHISPER_MODEL_ENV or "base.en"
+MLX_WHISPER_MODEL = _WHISPER_MODEL_ENV or "small.en"
+# auto: mlx-whisper on Apple-Silicon GPU when importable, else faster-whisper CPU.
+STT_ENGINE = (os.environ.get("AGENTICA_STT_ENGINE") or "auto").strip().lower()
+# mlx-whisper loads models from the HF hub by repo id; map the faster-whisper
+# style short names onto the community MLX conversions.
+_MLX_WHISPER_REPOS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "tiny.en": "mlx-community/whisper-tiny.en-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "base.en": "mlx-community/whisper-base.en-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "small.en": "mlx-community/whisper-small.en-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "medium.en": "mlx-community/whisper-medium.en-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+}
 # Kokoro is the default natural (open-weight, Apache-2.0) voice. af_heart is the
 # flagship; override with AGENTICA_KOKORO_VOICE (e.g. am_michael, af_bella).
 DEFAULT_KOKORO_VOICE = os.environ.get("AGENTICA_KOKORO_VOICE", "af_heart")
@@ -56,11 +82,54 @@ class VoiceUnavailable(RuntimeError):
 # Status
 # --------------------------------------------------------------------------- #
 def _faster_whisper_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("faster_whisper") is not None
+
+
+def _mlx_whisper_installed() -> bool:
+    # Do not import MLX just to answer /status. In headless/sandboxed macOS
+    # sessions its native Metal initializer can terminate the process rather
+    # than raise a catchable Python exception.
+    import importlib.util
+
+    return importlib.util.find_spec("mlx_whisper") is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _metal_available() -> bool:
+    """Probe Metal without importing MLX.
+
+    Importing MLX with no usable Metal device can terminate the whole process
+    from native code, so a normal try/except is insufficient. The framework
+    probe safely returns a null device in headless/sandboxed macOS sessions.
+    """
+    import ctypes
+    import platform
+
+    if platform.system() != "Darwin":
+        return False
     try:
-        import faster_whisper  # noqa: F401
-        return True
+        metal = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/Metal.framework/Metal")
+        default_device = metal.MTLCreateSystemDefaultDevice
+        default_device.restype = ctypes.c_void_p
+        return bool(default_device())
     except Exception:  # noqa: BLE001
         return False
+
+
+def stt_engine() -> str | None:
+    """The STT engine that transcribe_pcm16 will actually use, or None."""
+    if STT_ENGINE == "mlx":
+        return "mlx" if _mlx_whisper_installed() and _metal_available() else None
+    if STT_ENGINE == "faster":
+        return "faster" if _faster_whisper_installed() else None
+    if _mlx_whisper_installed() and _metal_available():
+        return "mlx"
+    if _faster_whisper_installed():
+        return "faster"
+    return None
 
 
 def _piper_binary() -> Path | None:
@@ -87,31 +156,62 @@ def _kokoro_ready() -> bool:
     return KOKORO_MODEL.exists() and KOKORO_VOICES.exists()
 
 
+def _cached_hf_file(repo_id: str, filename: str, *, cache_dir: Path | None = None) -> bool:
+    """Return whether a complete Hub snapshot file is already local, without
+    touching the network. ``try_to_load_from_cache`` also respects HF_HOME and
+    HF_HUB_CACHE, unlike a hand-built ``~/.cache`` path."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        kwargs = {"cache_dir": str(cache_dir)} if cache_dir is not None else {}
+        cached = try_to_load_from_cache(repo_id, filename, **kwargs)
+        return isinstance(cached, str) and Path(cached).is_file()
+    except Exception:  # noqa: BLE001 - missing hub helper means "not ready"
+        return False
+
+
+def _stt_model_ready(engine: str | None = None) -> bool:
+    """Whether the selected STT weights can be loaded without a first-turn
+    download. Dependency availability alone is not readiness."""
+    selected = engine or stt_engine()
+    if selected == "mlx":
+        if Path(MLX_WHISPER_MODEL).is_dir():
+            return (Path(MLX_WHISPER_MODEL) / "weights.npz").is_file()
+        return _cached_hf_file(_mlx_whisper_repo(), "weights.npz")
+    if selected == "faster":
+        if _whisper_model is not None:
+            return True
+        if Path(DEFAULT_WHISPER_MODEL).is_dir():
+            return (Path(DEFAULT_WHISPER_MODEL) / "model.bin").is_file()
+        repo = (DEFAULT_WHISPER_MODEL if "/" in DEFAULT_WHISPER_MODEL
+                else f"Systran/faster-whisper-{DEFAULT_WHISPER_MODEL}")
+        return _cached_hf_file(repo, "model.bin", cache_dir=WHISPER_DIR)
+    return False
+
+
 def voice_status() -> dict:
     piper_bin = _piper_binary()
     piper_voice = _piper_voice()
-    whisper_ok = _faster_whisper_installed()
+    stt = stt_engine()
+    stt_ready = bool(stt and _stt_model_ready(stt))
     kokoro_ok = _kokoro_ready()
-    remote = remote_tts_status()  # None unless AGENTICA_TTS_URL is set + reachable
-    if remote:
-        engine = f"remote:{remote.get('engine', '?')}"
-    elif kokoro_ok:
+    if kokoro_ok:
         engine = "kokoro"
-    elif piper_voice:
+    elif piper_bin is not None and piper_voice is not None:
         engine = "piper"
     else:
         engine = None
     return {
-        "whisper_installed": whisper_ok,
-        "whisper_model": DEFAULT_WHISPER_MODEL,
+        "whisper_installed": stt is not None,
+        "whisper_model": MLX_WHISPER_MODEL if stt == "mlx" else DEFAULT_WHISPER_MODEL,
+        "stt_engine": stt,  # mlx (Apple GPU) | faster (CPU) | null
         "kokoro_installed": kokoro_ok,
         "kokoro_voice": DEFAULT_KOKORO_VOICE if kokoro_ok else None,
         "piper_installed": piper_bin is not None,
         "piper_voice": piper_voice.name if piper_voice else None,
-        "remote_tts": remote,  # {engine, sample_rate, device} or null
-        "stt_ready": whisper_ok,
-        # remote expressive > Kokoro (natural) > Piper (fallback).
-        "tts_ready": bool(remote) or kokoro_ok or (piper_bin is not None and piper_voice is not None),
+        "stt_ready": stt_ready,
+        # Local-only: Kokoro (natural) > Piper (small fallback).
+        "tts_ready": kokoro_ok or (piper_bin is not None and piper_voice is not None),
         "tts_engine": engine,
         "voice_home": str(VOICE_HOME),
     }
@@ -159,9 +259,10 @@ def selftest(phrase: str = "Agentica local voice self test, one two three.") -> 
 
 
 # --------------------------------------------------------------------------- #
-# STT — faster-whisper
+# STT — mlx-whisper (Apple-Silicon GPU) or faster-whisper (CPU)
 # --------------------------------------------------------------------------- #
 _whisper_model = None
+_mlx_repo: str | None = None
 
 
 def _load_whisper():
@@ -191,10 +292,16 @@ def _build_whisper():
     return _whisper_model
 
 
-def transcribe_pcm16(pcm: bytes, sample_rate: int = 16000) -> str:
-    """Transcribe little-endian PCM16 mono audio to text."""
-    model = _load_whisper()
-    import numpy as np  # faster-whisper pulls numpy in
+def _mlx_whisper_repo() -> str:
+    global _mlx_repo
+    if _mlx_repo is None:
+        model = MLX_WHISPER_MODEL
+        _mlx_repo = _MLX_WHISPER_REPOS.get(model, model)  # allow a raw HF repo id
+    return _mlx_repo
+
+
+def _to_float32_16k(pcm: bytes, sample_rate: int):
+    import numpy as np
 
     audio = np.frombuffer(pcm, dtype=np.int16).astype("float32") / 32768.0
     if sample_rate != 16000:
@@ -203,8 +310,99 @@ def transcribe_pcm16(pcm: bytes, sample_rate: int = 16000) -> str:
         idx = (np.arange(int(len(audio) * ratio)) / ratio).astype("int64")
         idx = idx[idx < len(audio)]
         audio = audio[idx]
+    return audio
+
+
+def transcribe_pcm16(pcm: bytes, sample_rate: int = 16000) -> str:
+    """Transcribe little-endian PCM16 mono audio to text with the active engine."""
+    _touch_voice_use()
+    engine = stt_engine()
+    if engine is None:
+        raise VoiceUnavailable(
+            "no STT engine installed (pip install mlx-whisper or faster-whisper)")
+    audio = _to_float32_16k(pcm, sample_rate)
+    if engine == "mlx":
+        import mlx_whisper
+
+        # mlx-whisper caches the loaded model per repo internally; the HF weights
+        # download on first use. language hint skips detection (a full extra pass).
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=_mlx_whisper_repo(),
+            language="en", fp16=True, verbose=None,
+        )
+        return str(result.get("text", "")).strip()
+    model = _load_whisper()
     segments, _ = model.transcribe(audio, language="en", beam_size=1)
     return " ".join(seg.text for seg in segments).strip()
+
+
+def warmup(*, download_missing: bool = True) -> dict:
+    """Pre-build the STT + TTS models so the FIRST voice turn doesn't pay lazy
+    model construction (measured multi-second on cold start). Called from a
+    daemon thread at gateway start. When weights are missing and
+    ``download_missing`` is True, trigger provisioning first.
+    """
+    out = {"stt": False, "tts": False, "downloaded": False}
+    selected = stt_engine()
+    need_stt = bool(selected) and not _stt_model_ready(selected)
+    need_tts = not _kokoro_ready() and not (_piper_binary() and _piper_voice())
+    if download_missing and (need_stt or need_tts or selected is None):
+        try:
+            out["downloaded"] = bool(install_voice(lambda _m: None))
+        except Exception:  # noqa: BLE001
+            out["downloaded"] = False
+    selected = stt_engine()
+    if selected and _stt_model_ready(selected):
+        try:
+            import numpy as np
+
+            silence = np.zeros(1600, dtype=np.int16).tobytes()  # 0.1s @16k
+            transcribe_pcm16(silence, 16000)
+            out["stt"] = True
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _load_kokoro()
+        out["tts"] = True
+    except Exception:  # noqa: BLE001
+        # Piper may still be ready even if Kokoro isn't installed.
+        if _piper_binary() is not None and _piper_voice() is not None:
+            out["tts"] = True
+    return out
+
+
+# Idle unload: release heavy STT/TTS globals after AGENTICA_VOICE_IDLE_S of
+# inactivity (default 30 minutes) so memory isn't pinned forever.
+_VOICE_IDLE_S = float(os.environ.get("AGENTICA_VOICE_IDLE_S", str(30 * 60)))
+_last_voice_use = 0.0
+_idle_timer: threading.Timer | None = None
+_idle_lock = threading.Lock()
+
+
+def _touch_voice_use() -> None:
+    global _last_voice_use, _idle_timer
+    _last_voice_use = time.time()
+    with _idle_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        if _VOICE_IDLE_S <= 0:
+            return
+        _idle_timer = threading.Timer(_VOICE_IDLE_S, unload_voice_models)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+
+def unload_voice_models() -> dict:
+    """Drop cached Whisper/Kokoro handles so RAM can be reclaimed."""
+    global _whisper_model, _kokoro, _idle_timer
+    with _load_lock:
+        _whisper_model = None
+        _kokoro = None
+    with _idle_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
+    return {"unloaded": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -253,51 +451,13 @@ def synthesize_piper_pcm(text: str) -> tuple[bytes, int]:
     return _wav_to_pcm(proc.stdout)
 
 
-# --------------------------------------------------------------------------- #
-# Remote expressive TTS (a GPU box running agentica_core.tts_server, reached
-# over an SSH tunnel). Set AGENTICA_TTS_URL to route the voice through it.
-# --------------------------------------------------------------------------- #
-def remote_tts_url() -> str | None:
-    return os.environ.get("AGENTICA_TTS_URL")
-
-
-def remote_tts_status(timeout: float = 1.5) -> dict | None:
-    import urllib.request
-
-    url = remote_tts_url()
-    if not url:
-        return None
-    try:
-        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def synthesize_remote_pcm(text: str, **kw) -> tuple[bytes, int]:
-    import urllib.request
-
-    url = remote_tts_url()
-    if not url:
-        raise VoiceUnavailable("AGENTICA_TTS_URL not set")
-    payload = json.dumps({"text": text, **kw}).encode()
-    req = urllib.request.Request(
-        url.rstrip("/") + "/tts", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        wav = r.read()
-    return _wav_to_pcm(wav)
-
-
 def synthesize_pcm(text: str) -> tuple[bytes, int]:
-    """Synthesize to (pcm16_bytes, sample_rate). Order of preference:
-    remote expressive (if AGENTICA_TTS_URL reachable) -> Kokoro (natural) -> Piper."""
-    if remote_tts_url():
-        try:
-            return synthesize_remote_pcm(text)
-        except Exception:  # noqa: BLE001 - remote down -> fall back to local
-            pass
+    """Synthesize locally to ``(pcm16_bytes, sample_rate)``.
+
+    Kokoro is the natural default; Piper is the small, portable fallback. Voice
+    mode deliberately never calls a remote/cloud TTS endpoint.
+    """
+    _touch_voice_use()
     try:
         return synthesize_kokoro_pcm(text)
     except VoiceUnavailable:
@@ -329,15 +489,27 @@ PIPER_VOICE_FILES = ["en_US-lessac-medium.onnx", "en_US-lessac-medium.onnx.json"
 
 
 def install_voice(progress=lambda m: None) -> bool:
-    """Provision Whisper (pip) + Piper (binary + voice). Best-effort; returns ok."""
+    """Provision local Whisper + Kokoro/Piper. Best-effort; returns ok."""
     ok = True
     VOICE_HOME.mkdir(parents=True, exist_ok=True)
-    # Whisper: ensure the wheel is importable (the model itself lazy-downloads).
-    if not _faster_whisper_installed():
-        progress("faster-whisper not installed; run: pip install faster-whisper")
+    # STT: prefer the Apple-GPU engine; ensure a wheel is importable and pre-pull
+    # the model weights so the first spoken turn doesn't pay the download.
+    engine = stt_engine()
+    if engine is None:
+        progress("no STT engine installed; run: pip install mlx-whisper (Apple Silicon) "
+                 "or pip install faster-whisper")
         ok = False
     else:
-        progress("faster-whisper (STT) available")
+        progress(f"STT engine: {'mlx-whisper (Apple GPU)' if engine == 'mlx' else 'faster-whisper (CPU)'}")
+        try:
+            progress("fetching the speech-recognition model (first time only)…")
+            # 0.1 s of PCM16 silence. Keep provisioning independent of NumPy:
+            # the selected STT implementation owns any array conversion it needs.
+            transcribe_pcm16(b"\0" * 3200, 16000)
+            progress("speech-recognition model ready")
+        except Exception as exc:  # noqa: BLE001
+            progress(f"speech model fetch failed: {exc}")
+            ok = False
 
     # Kokoro: the natural default voice (model + voices download here).
     try:
@@ -378,23 +550,47 @@ def install_voice(progress=lambda m: None) -> bool:
 def _download_verified(url: str, dest: Path, progress, *, sha256: str | None = None, label: str = "") -> None:
     """Download to a temp file, verify sha256 (if pinned), then atomically rename.
     Never leaves a partial/poisoned file at ``dest``; never chmod/loads an
-    unverified asset when a hash is pinned."""
+    unverified asset when a hash is pinned. Reports byte-level progress when
+    Content-Length is available so the Voice UI can show a real progress bar.
+    """
     import hashlib
     import urllib.request
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     progress(f"downloading {label or dest.name}…")
-    urllib.request.urlretrieve(url, tmp)
+    req = urllib.request.Request(url, headers={"User-Agent": "agentica-voice"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        last_pct = -1
+        h = hashlib.sha256() if sha256 else None
+        with open(tmp, "wb") as fh:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                if h is not None:
+                    h.update(chunk)
+                done += len(chunk)
+                if total > 0:
+                    pct = int(100 * done / total)
+                    if pct != last_pct and (pct == 100 or pct - last_pct >= 2):
+                        last_pct = pct
+                        progress({
+                            "status": f"downloading {label or dest.name}",
+                            "completed": done,
+                            "total": total,
+                            "pct": pct,
+                        })
     if sha256:
-        h = hashlib.sha256()
-        with open(tmp, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        got = h.hexdigest()
+        got = h.hexdigest() if h is not None else ""
         if got != sha256.lower():
             tmp.unlink(missing_ok=True)
-            raise VoiceUnavailable(f"checksum mismatch for {dest.name}: expected {sha256[:12]}…, got {got[:12]}…")
+            raise VoiceUnavailable(
+                f"checksum mismatch for {dest.name}: expected {sha256[:12]}…, got {got[:12]}…"
+            )
     else:
         progress(f"warning: no pinned checksum for {dest.name} (trust-on-first-use)")
     os.replace(tmp, dest)

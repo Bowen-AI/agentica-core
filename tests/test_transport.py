@@ -75,3 +75,39 @@ def test_ssh_localhost_exec():
     t = Transport.ssh_localhost()
     res = t.exec("echo via-ssh")
     assert res.ok and res.out.strip() == "via-ssh"
+
+
+def test_local_tar_sync(tmp_path):
+    t = Transport.local()
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "file1.txt").write_text("content1")
+    (src / "sub").mkdir()
+    (src / "sub" / "file2.txt").write_text("content2")
+
+    dst = tmp_path / "dst"
+    res = t._tar_sync(str(src), str(dst), to_remote=True)
+    assert res.ok
+    assert (dst / "file1.txt").read_text() == "content1"
+    assert (dst / "sub" / "file2.txt").read_text() == "content2"
+
+
+def test_rsync_fallback_to_tar(tmp_path, monkeypatch):
+    t = Transport.local()
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("hello")
+    dst = tmp_path / "dst"
+
+    # Mock subprocess.run to raise FileNotFoundError when calling rsync
+    import subprocess
+    orig_run = subprocess.run
+    def mock_run(argv, *args, **kwargs):
+        if argv[0] == "rsync":
+            raise FileNotFoundError("rsync not found")
+        return orig_run(argv, *args, **kwargs)
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    res = t.push_dir(str(src), str(dst))
+    assert res.ok
+    assert (dst / "a.txt").read_text() == "hello"

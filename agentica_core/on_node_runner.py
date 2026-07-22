@@ -1,10 +1,9 @@
 """On-node agentic job runner: Planner -> Executor -> Auditor outer loop.
 
-Runs INSIDE the SLURM allocation. The auditor is an explicit Python loop (NOT a
-policy hook -- AgenticLocal's requires_approval does not pause the loop). The
-deterministic backstops (test exit code + artifact existence) WIN over the model
-verdict; the auditor's structured ``submit_for_audit`` call is the only model
-signal that can additionally fail an otherwise-green run for incompleteness.
+Runs INSIDE the SLURM allocation. The auditor is an explicit Python loop.
+When ``cancel_event`` is set, cooperative cancel stops between phases and also
+mid-tool via ``AgentController.run(..., cancel_event=...)``. Blocking approvals
+are available when an ``approval_callback`` is wired into the controller.
 """
 
 from __future__ import annotations
@@ -56,6 +55,7 @@ def run_job(
     model_timeout: float = 120.0,
     checkpoint_dir: str | None = None,
     _print=print,
+    cancel_event=None,
 ) -> JobOutcome:
     workspace_path = Path(workspace).resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
@@ -94,9 +94,20 @@ def run_job(
         log.append(msg)
         _print(msg)
 
+    def _cancelled(phase: str, iteration: int, plan_text: str = "") -> JobOutcome | None:
+        # Cooperative cancel between phases: a running model/tool call finishes,
+        # then the loop stops here instead of starting the next phase.
+        if cancel_event is not None and cancel_event.is_set():
+            note(f"[cancelled] stop requested before {phase}")
+            return JobOutcome(False, iteration, "NONE", False, False,
+                              gaps="cancelled by user", plan=plan_text, log=log)
+        return None
+
     # --- Planner ---
+    if (out := _cancelled("planner", 0)) is not None:
+        return out
     note("[planner] producing plan...")
-    plan_result = controller.run(plan.goal, workflow_key="planner")
+    plan_result = controller.run(plan.goal, workflow_key="planner", cancel_event=cancel_event)
     plan_text = plan_result.final_answer or ""
     _checkpoint(checkpoint_dir, "planner", {"plan": plan_text})
 
@@ -106,8 +117,10 @@ def run_job(
     executor_goal = plan.goal
 
     for i in range(1, plan.max_iterations + 1):
+        if (out := _cancelled(f"executor iteration {i}", i - 1, plan_text)) is not None:
+            return out
         note(f"[executor] iteration {i}/{plan.max_iterations}")
-        controller.run(executor_goal, workflow_key="executor")
+        controller.run(executor_goal, workflow_key="executor", cancel_event=cancel_event)
 
         # Deterministic backstops (authoritative). Restore any tampered grader/fixture
         # files to their pristine copy first, then score against them.
@@ -118,10 +131,13 @@ def run_job(
         note(f"[backstop] tests_ok={tests_ok} artifacts_ok={artifacts_ok}")
 
         # Auditor (model verdict; structured channel only).
+        if (out := _cancelled("auditor", i, plan_text)) is not None:
+            return out
         note("[auditor] verifying...")
         audit_result = controller.run(
             "Audit the work against the checklist and finish with submit_for_audit.",
             workflow_key="auditor",
+            cancel_event=cancel_event,
         )
         verdict, gaps = _extract_audit_verdict(audit_result)
         note(f"[auditor] verdict={verdict} gaps={gaps[:200]!r}")

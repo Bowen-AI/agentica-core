@@ -5,11 +5,16 @@ TTS streams down, nor an out-of-band barge-in. This gateway adds a full-duplex
 WebSocket alongside the (untouched) sync HTTP server, started on a daemon
 asyncio thread from ``apiserver.serve``.
 
+Voice is LOCAL-ONLY: open-weight Whisper STT + Kokoro TTS on this machine.
+Every turn — spoken or typed — runs the same tool-using agent loop as Chat
+mode; there is intentionally no plain-completion path and no browser/cloud
+speech engine.
+
 Client → server frames (JSON):
-  {type:"start", engine, target, model, workspace}
-  {type:"text", text}                      # transcript ready (browser STT) / typed
-  {type:"audio", pcm: <base64 pcm16>, sr}  # local engine: mic chunk
-  {type:"audio_end"}                       # local engine: utterance finished -> STT
+  {type:"start", token?, target, model, model_engine?, workspace?, workspace_target?}
+  {type:"text", text}                      # typed input (still an agent turn)
+  {type:"audio", pcm: <base64 pcm16>, sr}  # mic chunk
+  {type:"audio_end"}                       # utterance finished -> STT
   {type:"artifact_action", action}         # clicked a canvas card
   {type:"barge_in"}                        # interrupt the agent
 
@@ -19,13 +24,11 @@ Server → client frames (JSON):
   {type:"status", text}
   {type:"step", step}        {type:"artifact", artifact}
   {type:"answer", text}
-  {type:"speak", text}                     # browser TTS (no local Piper)
-  {type:"tts_audio", pcm: <base64>, sr}    # local Piper audio
+  {type:"tts_audio", pcm: <base64>, sr}    # local TTS audio
   {type:"done"}    {type:"error", error}
 
-Everything degrades: no ``websockets`` lib -> gateway is skipped (HTTP still
-serves); no Whisper/Piper -> the local engine asks the client to type / use
-browser TTS.
+Degrades: no ``websockets`` lib -> the gateway is skipped (HTTP still serves);
+no STT/TTS models -> spoken turns error with a download hint, typed turns work.
 """
 
 from __future__ import annotations
@@ -35,10 +38,13 @@ import base64
 import hmac
 import json
 import os
+import re as _re
 import threading
 from typing import Any
 
 from .voice_stream import stream_agent_turn
+
+_TURN_TIMEOUT_S = 180
 
 # Appended to the user's words before the agent runs (the UI still shows the
 # user's actual transcript): keeps spoken replies short + conversational.
@@ -49,39 +55,17 @@ _VOICE_STEER = (
 )
 
 # ---------------------------------------------------------------------------
-# Conversational-latency machinery. A measured agentic turn takes 10-17s before
-# the FIRST audio — dead air that makes voice mode feel broken. Two fixes:
-#   * fast path: utterances that don't need tools skip the agent loop and run a
-#     plain streamed completion (think=False ≈ first tokens <1.5s), speaking each
-#     sentence as it completes → first audio ~2-3s.
-#   * ack: tool-bound turns SAY a short acknowledgment up front, so the agent is
-#     never silent while the loop works.
+# Latency: an agentic turn takes seconds before the first real content — dead
+# air that makes voice mode feel broken. Every turn therefore SPEAKS a short,
+# intent-matched acknowledgment up front while the loop works. (The old
+# "fast path" that skipped the agent loop for chit-chat is gone on purpose:
+# every turn is agentic, so tools/memory always work and always persist.)
 # ---------------------------------------------------------------------------
-import re as _re
-
-# Tool-intent cues mirror the registered tools (get_weather, show_web, fetch_url,
-# browser_*, file/shell tools, csv, memory). Anything else is conversation.
-_TOOL_INTENT = _re.compile(
-    r"\b(weather|forecast|temperature|rain|snow|sunny|"
-    r"open|show|browse|website|web ?page|url|link|search|look ?up|news|"
-    r"read|write|create|edit|delete|list|file|files|folder|directory|csv|"
-    r"run|execute|shell|command|install|"
-    r"remember|recall|memor|"
-    r"screenshot|click|browser)\b", _re.IGNORECASE)
-
-_VOICE_SYSTEM = (
-    "You are Agentica, a friendly voice assistant. Reply in one or two short, "
-    "natural spoken sentences — no markdown, no lists, no headings. Be warm and direct."
-)
 
 # Internal agent-loop text that must never be spoken as the answer.
 _JUNK_ANSWER = _re.compile(
     r"(tool .{0,60} already (completed|ran)|"
     r"step limit|max[_ ]steps|\(interrupted\)|no answer was produced)", _re.IGNORECASE)
-
-
-def _needs_tools(text: str) -> bool:
-    return bool(_TOOL_INTENT.search(text or ""))
 
 
 def _ack_for(text: str) -> str:
@@ -92,6 +76,8 @@ def _ack_for(text: str) -> str:
         return "Let me look that up."
     if _re.search(r"open|show|browse|website|url|link", t):
         return "Sure — opening that now."
+    if _re.search(r"\b(hi|hello|hey|thanks|thank you)\b", t):
+        return ""  # a greeting needs no "on it" preamble
     return "On it — give me a few seconds."
 
 
@@ -115,8 +101,8 @@ def start_voice_gateway(state: Any, host: str = "127.0.0.1", port: int = 8771):
     try:
         import websockets  # noqa: F401
     except Exception:  # noqa: BLE001
-        print("voice gateway: 'websockets' not installed — voice 'local' engine disabled "
-              "(browser/cloud engines still work). pip install websockets to enable.")
+        print("voice gateway: 'websockets' not installed — voice mode disabled. "
+              "pip install websockets to enable.")
         return None
 
     def _run():
@@ -126,8 +112,21 @@ def start_voice_gateway(state: Any, host: str = "127.0.0.1", port: int = 8771):
 
     t = threading.Thread(target=_run, name="agentica-voice-gateway", daemon=True)
     t.start()
+    # Load the STT/TTS models off the first turn's critical path: the first
+    # utterance otherwise pays multi-second lazy Whisper/Kokoro construction.
+    threading.Thread(target=_warm_models, name="agentica-voice-warmup",
+                     daemon=True).start()
     print(f"agentica voice gateway (WebSocket) on ws://{host}:{port}")
     return t
+
+
+def _warm_models():
+    try:
+        from .voice_provision import warmup
+
+        warmup()
+    except Exception:  # noqa: BLE001 - models not installed yet; first turn reports it
+        pass
 
 
 async def _serve(state, host, port):
@@ -148,19 +147,18 @@ class _Conn:
         self.state = state
         self.ws = ws
         self.loop = asyncio.get_event_loop()
-        self.engine = "browser"
         self.target = "local"
         self.model = None
+        self.model_engine = None
         self.workspace = None
+        self.workspace_target = "local"
         self.session_id = None
         self.turn_id = 0
         self.task: asyncio.Task | None = None
         self.cancel: threading.Event | None = None  # set on barge-in to stop the agent loop
         self.audio = bytearray()
         self.audio_sr = 16000
-        # Rolling spoken-conversation history (shared by the fast path and used
-        # for continuity when turns alternate between routes). Capped small.
-        self.history: list[dict] = []
+        self._approval_box: dict[str, Any] | None = None
         # Same shared-secret gate as the HTTP API: when AGENTICA_API_TOKEN is set
         # the client's `start` message must carry it, else any local process /
         # web page could open ws://127.0.0.1:8771 and drive the agent.
@@ -181,8 +179,15 @@ class _Conn:
         except Exception:  # noqa: BLE001 - client dropped
             pass
         finally:
-            if self.task:
-                self.task.cancel()
+            task = self.task
+            if self.cancel:
+                self.cancel.set()
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def _send(self, obj):
         try:
@@ -206,10 +211,11 @@ class _Conn:
                     pass
                 return
         if t == "start":
-            self.engine = msg.get("engine", "browser")
             self.target = msg.get("target", "local")
             self.model = msg.get("model")
+            self.model_engine = msg.get("model_engine")
             self.workspace = msg.get("workspace")
+            self.workspace_target = msg.get("workspace_target", "local")
             try:
                 app = self._app()
                 self.session_id = app.create_session() if hasattr(app, "create_session") else None
@@ -218,7 +224,11 @@ class _Conn:
                 return
             await self._send({"type": "session", "session_id": self.session_id})
         elif t == "text":
-            self._spawn_turn((msg.get("text") or "").strip())
+            text = (msg.get("text") or "").strip()
+            if text:
+                await self._spawn_turn(text)
+            else:
+                await self._error_done("text is empty")
         elif t == "audio":
             pcm = msg.get("pcm")
             if pcm:
@@ -229,228 +239,246 @@ class _Conn:
         elif t == "artifact_action":
             phrase = _action_to_phrase(msg.get("action") or {})
             if phrase:
-                self._spawn_turn(phrase)
+                await self._spawn_turn(phrase)
         elif t == "barge_in":
-            self._interrupt()  # supersede emits/speaking AND stop the agent loop
+            await self._interrupt()  # supersede emits/speaking AND stop the agent loop
+        elif t in {"approve", "deny"}:
+            box = self._approval_box
+            if box and box.get("event") is not None:
+                box["result"] = t == "approve"
+                box["event"].set()
 
     def _app(self):
-        return self.state.app_for(self.workspace, target=self.target, model=self.model, engine=None)
+        return self.state.app_for(self.workspace, target=self.target, model=self.model,
+                                  engine=self.model_engine,
+                                  workspace_target=self.workspace_target)
 
-    def _interrupt(self):
+    async def _error_done(self, error: str):
+        """Terminate an accepted turn that cannot reach ``_run_turn``."""
+        await self._send({"type": "error", "error": error})
+        await self._send({"type": "done"})
+
+    async def _interrupt(self):
         # Stop the in-flight turn: drop its emits (turn_id), stop the agent loop at
         # its next step boundary (cancel event -> no more tools/model calls), and
-        # cancel the asyncio wrapper.
+        # cancel the asyncio wrapper. Await it so its terminal ``done`` is ordered
+        # before a replacement turn begins.
         self.turn_id += 1
         if self.cancel:
             self.cancel.set()
-        if self.task and not self.task.done():
-            self.task.cancel()
+        task = self.task
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self.task is task:
+            self.task = None
 
-    def _spawn_turn(self, text: str):
+    async def _spawn_turn(self, text: str):
         if not text:
             return
-        self._interrupt()  # a new utterance supersedes any running turn
+        await self._interrupt()  # a new utterance supersedes any running turn
         self.task = self.loop.create_task(self._run_turn(text))
 
     async def _transcribe_and_turn(self):
         pcm = bytes(self.audio)
         self.audio = bytearray()
         if not pcm:
+            await self._error_done("no speech audio received")
             return
         try:
             from .voice_provision import transcribe_pcm16
 
             text = await self.loop.run_in_executor(None, transcribe_pcm16, pcm, self.audio_sr)
         except Exception as exc:  # noqa: BLE001
-            await self._send({"type": "error", "error": f"speech-to-text unavailable: {exc}"})
+            await self._error_done(f"speech-to-text unavailable: {exc}")
+            return
+        text = (text or "").strip()
+        if not text:
+            await self._error_done("no speech recognized")
             return
         # (_run_turn echoes the final transcript — sending here too double-fires it.)
-        self._spawn_turn(text)
+        await self._spawn_turn(text)
 
     async def _run_turn(self, text: str):
+        """Every turn is agentic — the same tool loop as Chat mode."""
         # turn_id was already advanced by _interrupt() in _spawn_turn; just capture it.
         my = self.turn_id
-        await self._send({"type": "transcript", "text": text, "final": True})
-        # Route: conversation -> fast streamed completion (first audio ~2-3s);
-        # tool intent -> the agent loop, but never silently (spoken ack first).
-        if not _needs_tools(text):
-            try:
-                await self._run_fast_turn(text, my)
-                return
-            except Exception:  # noqa: BLE001 - fast path down -> the full loop still works
-                if self.turn_id != my:
-                    return
-        await self._run_agent_turn(text, my)
-
-    def _remember(self, user_text: str, answer: str):
-        self.history.append({"role": "user", "content": user_text})
-        self.history.append({"role": "assistant", "content": answer})
-        del self.history[:-12]  # keep the last 6 exchanges
-
-    async def _run_fast_turn(self, text: str, my: int):
-        """Conversational path: plain streamed completion, SPEAKING each sentence as
-        it completes — no tool loop, no dead air."""
-        msgs = [{"role": "system", "content": _VOICE_SYSTEM}, *self.history,
-                {"role": "user", "content": text}]
-        state = self.state
-        target, model = self.target, self.model
-        pending: list[str] = []  # text since the last spoken sentence (executor thread only)
-        full: list[str] = []     # everything generated so far (for the answer frame)
-
-        def flush(force: bool = False):
-            # Called on the executor thread: peel off completed sentences, synth, ship.
-            buf = "".join(pending)
-            while True:
-                m = _re.search(r"[.!?][\"')\]]?\s", buf)
-                if m:
-                    sentence, buf = buf[:m.end()].strip(), buf[m.end():]
-                elif force and buf.strip():
-                    sentence, buf = buf.strip(), ""
-                else:
-                    break
-                if sentence and self.turn_id == my:
-                    self._synth_send_blocking(sentence, my)
-                if not buf:
-                    break
-            pending.clear()
-            pending.append(buf)
-
-        def on_content(tok: str):
-            if self.turn_id != my:
-                return
-            pending.append(tok)
-            full.append(tok)
-            # The UI replaces the answer text per frame — send the accumulated text
-            # so it grows live (per-token deltas would blank it).
-            asyncio.run_coroutine_threadsafe(
-                self._send({"type": "answer", "text": "".join(full)}), self.loop)
-            flush()
-
-        def work():
-            out = state.complete_stream(msgs, on_content=on_content, think=False,
-                                        target=target, model=model, engine=None)
-            flush(force=True)
-            return out
-
-        await self._send({"type": "status", "text": "thinking…"})
-        answer = await asyncio.wait_for(self.loop.run_in_executor(None, work), timeout=120)
-        if self.turn_id != my:
-            return
-        answer = (answer or "").strip()
-        if not answer:
-            raise RuntimeError("fast path produced no answer")
-        self._remember(text, answer)
-        await self._send({"type": "answer", "text": answer})
-        await self._send({"type": "done"})
-
-    def _synth_send_blocking(self, sentence: str, my: int):
-        """Synthesize one sentence and ship it (called from an executor thread).
-        Falls back to a browser-TTS `speak` frame if local TTS isn't available."""
-        try:
-            from .voice_provision import synthesize_pcm
-
-            if self.engine == "local":
-                pcm, sr = synthesize_pcm(sentence)
-                if self.turn_id == my:
-                    asyncio.run_coroutine_threadsafe(self._send({
-                        "type": "tts_audio",
-                        "pcm": base64.b64encode(pcm).decode("ascii"),
-                        "sr": sr,
-                    }), self.loop)
-                return
-        except Exception:  # noqa: BLE001 - fall through to browser TTS
-            pass
-        if self.turn_id == my:
-            asyncio.run_coroutine_threadsafe(
-                self._send({"type": "speak", "text": sentence}), self.loop)
-
-    async def _run_agent_turn(self, text: str, my: int):
         # A fresh cancel token for THIS turn, captured in the closure so a later turn
         # replacing self.cancel can't make us pass the wrong event into the executor.
         cancel = self.cancel = threading.Event()
         try:
-            app = self._app()
-        except Exception as exc:  # noqa: BLE001
-            await self._send({"type": "error", "error": f"turn: {exc}"})
-            return
+            await self._send({"type": "transcript", "text": text, "final": True})
+            try:
+                app = self._app()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"turn: {exc}") from exc
 
-        # Speak an acknowledgment BEFORE the loop starts — a tool turn takes 10s+,
-        # and silent "thinking" is what makes voice mode feel broken.
-        await self.loop.run_in_executor(None, self._synth_send_blocking, _ack_for(text), my)
-        await self._send({"type": "status", "text": "working on it…"})
+            # Speak an acknowledgment BEFORE the loop starts — silent "thinking" is
+            # what makes voice mode feel broken.
+            ack = _ack_for(text)
+            if ack:
+                await self.loop.run_in_executor(None, self._synth_send_blocking, ack, my)
+            await self._send({"type": "status", "text": "working on it…"})
 
-        last_summary: list[str | None] = [None]
+            last_summary: list[str | None] = [None]
+            spoken_final = threading.Event()
+            approval_box: dict[str, Any] = {"event": None, "result": None}
 
-        def emit(frame):
-            if self.turn_id != my:
-                return
-            if "step" in frame:
-                obs = (frame["step"] or {}).get("observation")
-                if isinstance(obs, dict) and isinstance(obs.get("summary"), str):
-                    last_summary[0] = obs["summary"]
-                out = {"type": "step", "step": frame["step"]}
-            elif "artifact" in frame:
-                out = {"type": "artifact", "artifact": frame["artifact"]}
-            else:
-                return
-            asyncio.run_coroutine_threadsafe(self._send(out), self.loop)
+            def emit(frame):
+                if self.turn_id != my:
+                    return
+                if "final_answer" in frame:
+                    # Start TTS as soon as the engine logs final_answer — don't
+                    # wait for stream_agent_turn's worker thread to join.
+                    answer = _clean_answer(frame.get("final_answer") or "", last_summary[0])
+                    if answer and not spoken_final.is_set():
+                        spoken_final.set()
+                        asyncio.run_coroutine_threadsafe(
+                            self._send({"type": "answer", "text": answer}), self.loop)
+                        threading.Thread(
+                            target=self._speak_blocking,
+                            args=(answer, my),
+                            daemon=True,
+                            name="agentica-early-tts",
+                        ).start()
+                    return
+                if "approval" in frame:
+                    asyncio.run_coroutine_threadsafe(self._send({
+                        "type": "approval_required",
+                        **(frame.get("approval") or {}),
+                    }), self.loop)
+                    return
+                if "step" in frame:
+                    obs = (frame["step"] or {}).get("observation")
+                    if isinstance(obs, dict) and isinstance(obs.get("summary"), str):
+                        last_summary[0] = obs["summary"]
+                    out = {"type": "step", "step": frame["step"]}
+                elif "artifact" in frame:
+                    out = {"type": "artifact", "artifact": frame["artifact"]}
+                else:
+                    return
+                asyncio.run_coroutine_threadsafe(self._send(out), self.loop)
 
-        # Steer the model toward a short, conversational spoken reply — details,
-        # lists, and tables belong on the canvas, not read aloud.
-        agent_text = text + _VOICE_STEER
+            def approval_callback(call, decision):
+                # Pause the agent loop until the client sends approve/deny.
+                approval_box["event"] = threading.Event()
+                approval_box["result"] = None
+                asyncio.run_coroutine_threadsafe(self._send({
+                    "type": "approval_required",
+                    "tool": getattr(call, "name", None),
+                    "arguments": getattr(call, "arguments", {}) or {},
+                    "reason": getattr(decision, "reason", ""),
+                    "blocking": True,
+                }), self.loop)
+                ev = approval_box["event"]
+                while not ev.wait(0.25):
+                    if self.turn_id != my or cancel.is_set():
+                        return False
+                return bool(approval_box.get("result"))
 
-        def work():
-            return stream_agent_turn(app, agent_text, self.session_id, emit, cancel_event=cancel)
+            # Steer the model toward a short, conversational spoken reply — details,
+            # lists, and tables belong on the canvas, not read aloud.
+            agent_text = text + _VOICE_STEER
+            self._approval_box = approval_box
 
-        try:
+            def work():
+                return stream_agent_turn(
+                    app, agent_text, self.session_id, emit,
+                    cancel_event=cancel,
+                    max_steps=4,
+                    approval_callback=approval_callback,
+                )
+
             # Per-turn wall-clock deadline so a wedged model/tool can't leave the
             # conversation stuck in "thinking" forever. On timeout, tell the agent
             # loop to stop (cancel) and report the error.
-            res = await asyncio.wait_for(self.loop.run_in_executor(None, work), timeout=180)
+            res = await asyncio.wait_for(
+                self.loop.run_in_executor(None, work), timeout=_TURN_TIMEOUT_S)
+            if self.turn_id != my:
+                return
+            self.session_id = res.get("session_id", self.session_id)
+            # Never speak loop bookkeeping — prefer the last tool's human summary.
+            answer = _clean_answer(res.get("final_answer") or "", last_summary[0])
+            if not spoken_final.is_set():
+                await self._send({"type": "answer", "text": answer})
+                await self._speak(answer, my)
+            else:
+                # Early TTS already started; still ensure the text answer is on screen.
+                await self._send({"type": "answer", "text": answer})
         except asyncio.TimeoutError:
             cancel.set()
             if self.turn_id == my:
                 await self._send({"type": "error", "error": "the agent took too long and was stopped"})
-                await self._send({"type": "done"})
-            return
         except asyncio.CancelledError:
-            return
+            cancel.set()
+            raise
         except Exception as exc:  # noqa: BLE001
-            await self._send({"type": "error", "error": str(exc)})
+            if self.turn_id == my:
+                await self._send({"type": "error", "error": str(exc)})
+        finally:
+            # Exactly one terminal frame for every accepted turn — success, timeout,
+            # cancellation, app/model failure, or TTS failure.
+            await self._send({"type": "done"})
+            if self.cancel is cancel:
+                self.cancel = None
+            if self.task is asyncio.current_task():
+                self.task = None
+
+    def _synth_send_blocking(self, sentence: str, my: int):
+        """Synthesize one sentence and ship it (called from an executor thread)."""
+        try:
+            from .voice_provision import synthesize_pcm
+
+            pcm, sr = synthesize_pcm(sentence)
+        except Exception:  # noqa: BLE001 - no TTS: the text answer still shows
             return
-        if self.turn_id != my:
+        if self.turn_id == my:
+            asyncio.run_coroutine_threadsafe(self._send({
+                "type": "tts_audio",
+                "pcm": base64.b64encode(pcm).decode("ascii"),
+                "sr": sr,
+            }), self.loop)
+
+    def _speak_blocking(self, text: str, my: int):
+        """Full-answer TTS from a worker thread (early final_answer path)."""
+        text = _spoken_text(text)
+        if not text:
             return
-        self.session_id = res.get("session_id", self.session_id)
-        # Never speak loop bookkeeping — prefer the last tool's human summary.
-        answer = _clean_answer(res.get("final_answer") or "", last_summary[0])
-        self._remember(text, answer)
-        await self._send({"type": "answer", "text": answer})
-        await self._speak(answer, my)
-        await self._send({"type": "done"})
+        try:
+            from .voice_provision import synthesize_pcm, voice_status
+
+            if not voice_status().get("tts_ready"):
+                return
+            for sentence in _split_sentences(text):
+                if self.turn_id != my:
+                    return
+                self._synth_send_blocking(sentence, my)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _speak(self, text: str, my: int):
         text = _spoken_text(text)
         if not text:
             return
-        # Local engine + provisioned Piper -> stream PCM; else browser TTS.
-        if self.engine == "local":
-            try:
-                from .voice_provision import synthesize_pcm, voice_status
+        try:
+            from .voice_provision import synthesize_pcm, voice_status
 
-                if voice_status().get("tts_ready"):
-                    for sentence in _split_sentences(text):
-                        if self.turn_id != my:
-                            return
-                        pcm, sr = await self.loop.run_in_executor(None, synthesize_pcm, sentence)
-                        await self._send({
-                            "type": "tts_audio",
-                            "pcm": base64.b64encode(pcm).decode("ascii"),
-                            "sr": sr,
-                        })
+            if not voice_status().get("tts_ready"):
+                return  # the text answer is already on screen
+            for sentence in _split_sentences(text):
+                if self.turn_id != my:
                     return
-            except Exception:  # noqa: BLE001 - fall through to browser TTS
-                pass
-        await self._send({"type": "speak", "text": text})
+                pcm, sr = await self.loop.run_in_executor(None, synthesize_pcm, sentence)
+                await self._send({
+                    "type": "tts_audio",
+                    "pcm": base64.b64encode(pcm).decode("ascii"),
+                    "sr": sr,
+                })
+        except Exception:  # noqa: BLE001 - TTS failure must not kill the turn
+            pass
 
 
 def _split_sentences(text: str) -> list[str]:

@@ -50,7 +50,11 @@ def main(argv=None) -> int:
     p_up.add_argument("--model", default=None, help="Override the served model tag (else cluster.yaml model.name).")
     p_up.add_argument("--workspace", default="sample_workspace")
     p_up.add_argument("--db", default=".agentic/agentic.db")
-    p_up.add_argument("--v1-mode", choices=["passthrough", "agentic"], default="passthrough")
+    p_up.add_argument(
+        "--v1-mode", choices=["agentic", "passthrough"], default="agentic",
+        help=("OpenAI-compatible API mode. 'passthrough' is retained as a deprecated "
+              "alias; all requests still run the agent loop."),
+    )
     p_up.add_argument("--skip-preflight", action="store_true")
 
     p_down = sub.add_parser("down", help="Cancel a running serve job.")
@@ -64,6 +68,11 @@ def main(argv=None) -> int:
     j_submit.add_argument("plan")
     j_submit.add_argument("--no-sync-code", action="store_true",
                           help="Do not rsync the package source (assume installed on the cluster).")
+    j_submit.add_argument(
+        "--workspace-source", choices=["local", "remote"], default=None,
+        help=("Where plan.workspace exists: 'local' stages it to the worker; "
+              "'remote' uses the path already on the SSH/SLURM worker."),
+    )
     for name in ("status", "logs", "cancel"):
         jp = job_sub.add_parser(name)
         jp.add_argument("cluster")
@@ -171,13 +180,16 @@ def _hosts() -> int:
 def _job(args) -> int:
     from . import job
     if args.job_command == "submit":
-        return job.submit(args.cluster, args.plan, sync_code=not args.no_sync_code)
+        return job.submit(
+            args.cluster, args.plan, sync_code=not args.no_sync_code,
+            workspace_source=args.workspace_source,
+        )
     if args.job_command == "status":
         return job.status(args.cluster, args.job, jobdir=args.jobdir)
     if args.job_command == "logs":
         return job.logs(args.cluster, args.job, jobdir=args.jobdir)
     if args.job_command == "cancel":
-        return job.cancel(args.cluster, args.job)
+        return job.cancel(args.cluster, args.job, jobdir=args.jobdir)
     if args.job_command == "fetch":
         return job.fetch_artifacts(args.cluster, args.jobdir, args.out)
     print("usage: slurm-agentic job {submit|status|logs|cancel|fetch} ...")

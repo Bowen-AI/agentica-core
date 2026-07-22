@@ -69,7 +69,7 @@ class SlurmConfig:
 
 @dataclass
 class ModelConfig:
-    engine: str = DEFAULT_ENGINE  # "ollama" | "vllm"
+    engine: str = DEFAULT_ENGINE  # "ollama" | "vllm" | "mlx" | "mlx-lm"
     name: str = DEFAULT_MODEL
     quantization: str | None = None  # None -> chosen by GPU arch in preflight_fit
     tensor_parallel_size: int = 1
@@ -80,8 +80,10 @@ class ModelConfig:
     timeout_s: float = 120.0  # per-request HTTP timeout (raise for slow GPUs like P100)
 
     def __post_init__(self) -> None:
-        if self.engine not in {"ollama", "vllm"}:
-            raise ConfigError(f"model.engine must be 'ollama' or 'vllm', got {self.engine!r}")
+        if self.engine not in {"ollama", "vllm", "mlx", "mlx-lm"}:
+            raise ConfigError(
+                f"model.engine must be 'ollama', 'vllm', or 'mlx', got {self.engine!r}"
+            )
         if self.engine == "vllm" and self.serve_port == DEFAULT_OLLAMA_PORT:
             self.serve_port = DEFAULT_VLLM_PORT
 

@@ -4,17 +4,23 @@ Endpoints (all JSON, CORS-enabled for the Vite dev server):
 
   GET  /api/health
   GET  /api/hosts                      -> ssh-config hosts + a "local" target
-  POST /api/chat       {message, mode: agentic|plain, session_id?, workspace?}
-  GET  /api/history?session_id=&workspace=
-  POST /api/plan/draft {goal, workspace?}                 -> {title, lines[], tests, artifacts}
+  POST /api/chat       {message, session_id?, workspace?, workspace_target?, target?}
+  GET  /api/history?session_id=
+  GET  /api/sessions                   -> stored transcripts (id, title, counts)
+  POST /api/sessions/delete {session_ids?: [..], all?: bool}
+  POST /api/plan/draft {goal, workspace?, workspace_target?} -> {title, lines[], ...}
   POST /api/plan/refine{plan, comments[]}                 -> updated plan
-  POST /api/job/submit {plan, target}                     -> {job_id, jobdir, target, local}
+  POST /api/job/submit {plan, target, workspace?, workspace_target?}
   GET  /api/job/status?target=&job=&jobdir=&local_id=
   GET  /api/job/logs?...
+  POST /api/job/fetch  {target, jobdir, dest}             -> rsync results back
 
-Chat reuses the gateway's AgentServerApp (agentic loop, tools, memory). Plain chat
-+ planning are direct ollama /v1 completions. Jobs go local (background thread) or
-remote (job.submit over ssh/SLURM, any ~/.ssh/config target).
+Every chat turn is AGENTIC -- it runs the gateway's AgentServerApp (tool loop,
+memory); there is intentionally no plain-completion chat mode. Planning uses a
+direct structured completion (it produces a JSON document, not tool activity).
+``target`` picks the machine that hosts the MODEL; ``workspace_target`` picks the
+machine whose files/shell the agent's tools operate on -- the two are independent.
+Jobs go local (background thread) or remote (job.submit over ssh/SLURM).
 """
 
 from __future__ import annotations
@@ -31,21 +37,18 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import catalog, gateway, job, serving, sshconfig
+from . import __version__, catalog, gateway, job, serving, sshconfig
 from .voice_stream import stream_agent_turn
 from .voice_gateway import start_voice_gateway
 from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, ModelConfig,
                      PlanConfig, SuccessCriteria)
 from .on_node_runner import run_job
 from .transport import Transport
-
-__version__ = "0.2.3"
-
 
 # --------------------------------------------------------------------------- #
 # runtime context injected into the model (open models have a stale training
@@ -65,12 +68,14 @@ def _runtime_preamble(
     target: str | None = None,
     model: str | None = None,
     engine: str | None = None,
+    workspace_target: str | None = None,
 ) -> str:
     """Live context for the model -- authoritative for any date/time/'today'/'now'
     question (the model's own training data is stale)."""
     now = datetime.datetime.now().astimezone()
     osname = "macOS" if os.uname().sysname == "Darwin" else os.uname().sysname
     t = (target or "local").strip() or "local"
+    wt = (workspace_target or "local").strip() or "local"
     m = f" using {model}" if model else ""
     e = f" via {engine}" if engine else ""
     lines = [
@@ -82,10 +87,12 @@ def _runtime_preamble(
         lines.append(f"- Model inference target: local on {osname} ({os.uname().machine}){m}{e}.")
     else:
         lines.append(f"- Model inference target: {t}{m}{e}.")
+    if wt == "local":
         lines.append(
-            f"- Agentica's UI/backend and chat tools run on the local {osname} "
-            f"({os.uname().machine}); submitted jobs run on the selected target."
+            f"- Your file/shell tools operate on the local {osname} ({os.uname().machine})."
         )
+    else:
+        lines.append(f"- Your file/shell tools operate on the remote host {wt} over SSH.")
     if workspace:
         lines.append(f"- Working directory: {workspace}")
     return "\n".join(lines)
@@ -153,9 +160,11 @@ class State:
         self._apps: dict[tuple, object] = {}        # runtime/workspace -> AgentServerApp
         self._runtimes: dict[tuple[str, str, str], RuntimeBinding] = {}
         self._runtime_lock = threading.Lock()
-        self.local_jobs: dict[str, dict] = {}        # local_id -> {status, outcome, ...}
+        self.local_jobs: dict[str, dict] = _load_local_jobs(db_path)
         self._model_resolved = False
         self.clusters = load_clusters(clusters_dir)  # name -> {path, host, scheduler}
+        # Pending chat approvals: approval_id -> {"event": Event, "result": bool|None}
+        self.pending_approvals: dict[str, dict] = {}
 
     def cluster_path(self, target: str) -> str:
         """Map a target name to its cluster.yaml path if it's a known cluster, else
@@ -260,12 +269,22 @@ class State:
             return runtime
 
     def app_for(self, workspace: str | None, target: str | None = None,
-                model: str | None = None, engine: str | None = None, notify=None):
-        ws = workspace or self.workspace
+                model: str | None = None, engine: str | None = None,
+                workspace_target: str | None = None, notify=None):
+        """Agent app with the model on ``target`` and tools on ``workspace_target``.
+
+        The two machines are independent: a big SSH box can host inference while
+        the agent's file/shell tools keep operating on this machine's checkout
+        (or another host's). ``workspace_target`` defaults to local."""
+        tools_target = (workspace_target or "local").strip() or "local"
+        # Never reuse the backend's local absolute data path on an SSH host.
+        # With no explicit remote path, operate from that host's current/home dir.
+        ws = workspace or (self.workspace if tools_target == "local" else ".")
         rt = self.runtime_for(target, model, engine, notify=notify)
         # Key by date too, so a long-running backend rebuilds with a fresh "today" in
         # the system preamble (the AgentServerApp caches its controller/system prompt).
-        key = (ws, datetime.date.today().isoformat(), rt.target, rt.model, rt.engine, rt.base_url)
+        key = (ws, tools_target, datetime.date.today().isoformat(),
+               rt.target, rt.model, rt.engine, rt.base_url)
         if key not in self._apps:
             provider = "ollama" if rt.engine == "ollama" else "openai-compatible"
             self._apps[key] = gateway.build_app(
@@ -274,26 +293,12 @@ class State:
                 provider=provider, api_base=rt.api_base,
                 system_prompt=AGENTICA_SYSTEM_PROMPT + "\n\n" + _runtime_preamble(
                     ws, target=rt.target, model=rt.model, engine=rt.engine,
-                ))
+                    workspace_target=tools_target,
+                ),
+                tools_target=(self.cluster_path(tools_target)
+                              if tools_target != "local" else "local"),
+            )
         return self._apps[key]
-
-    def complete(self, messages: list[dict], temperature: float = 0.2, timeout: float = 180,
-                 target: str | None = None, model: str | None = None,
-                 engine: str | None = None) -> str:
-        """Plain (non-agentic) chat completion via the engine's OpenAI /v1."""
-        rt = self.runtime_for(target, model, engine)
-        url = rt.api_base + "/chat/completions"
-        body = json.dumps({"model": rt.model, "messages": messages,
-                           "temperature": temperature, "stream": False}).encode()
-        req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
-        except (urllib.error.URLError, TimeoutError) as exc:
-            reason = getattr(exc, "reason", None) or str(exc) or "request timed out"
-            raise RuntimeError(f"model unreachable at {rt.base_url}: {reason}")
 
     def complete_stream(self, messages: list[dict], on_reasoning=None, on_content=None,
                         think: bool = True, fmt: str | None = None,
@@ -596,29 +601,84 @@ def model_catalog_for_target(state: State, target: str | None) -> dict:
 # --------------------------------------------------------------------------- #
 # workspace context + planning
 # --------------------------------------------------------------------------- #
-def workspace_summary(ws: str, max_files: int = 40, max_bytes: int = 1500) -> str:
-    root = Path(ws)
-    if not root.exists():
-        return ""
-    lines = [f"Workspace: {root}"]
-    files = [p for p in sorted(root.rglob("*")) if p.is_file()][:max_files]
-    for p in files:
-        rel = p.relative_to(root)
-        lines.append(f"- {rel}")
-    # include a small preview of a few text files
-    for p in files[:6]:
-        try:
-            txt = p.read_text(encoding="utf-8")[:max_bytes]
-        except Exception:
-            continue
-        lines.append(f"\n### {p.relative_to(root)}\n{txt}")
-    return "\n".join(lines)
+# Runs on the remote workspace host via `python3 -c "exec(b64decode(...))"` -- a
+# real multi-line script, because for/try cannot be folded into a ;-joined -c
+# one-liner (that was a guaranteed SyntaxError and silently blanked the context).
+_REMOTE_SUMMARY_SRC = """\
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]).expanduser().resolve()
+max_files, max_bytes = int(sys.argv[2]), int(sys.argv[3])
+if not root.exists():
+    sys.exit(0)
+files = [p for p in sorted(root.rglob('*')) if p.is_file()][:max_files]
+lines = [f'Workspace: {root}']
+for p in files:
+    lines.append(f'- {p.relative_to(root)}')
+for p in files[:6]:
+    try:
+        txt = p.read_text(encoding='utf-8')[:max_bytes]
+    except Exception:
+        continue
+    lines.append(f'\\n### {p.relative_to(root)}\\n{txt}')
+print('\\n'.join(lines))
+"""
+
+
+def workspace_summary(
+    ws: str,
+    max_files: int = 40,
+    max_bytes: int = 1500,
+    workspace_target: str | None = None,
+    *,
+    target: str | None = None,
+) -> str:
+    """File listing + previews of the workspace ON THE MACHINE THAT OWNS IT
+    (never the inference machine). ``target`` is a compatibility alias."""
+    t = (workspace_target if workspace_target is not None else target) or "local"
+    t = t.strip() or "local"
+    if t == "local":
+        root = Path(ws)
+        if not root.exists():
+            return ""
+        lines = [f"Workspace: {root}"]
+        files = [p for p in sorted(root.rglob("*")) if p.is_file()][:max_files]
+        for p in files:
+            rel = p.relative_to(root)
+            lines.append(f"- {rel}")
+        # include a small preview of a few text files
+        for p in files[:6]:
+            try:
+                txt = p.read_text(encoding="utf-8")[:max_bytes]
+            except Exception:
+                continue
+            lines.append(f"\n### {p.relative_to(root)}\n{txt}")
+        return "\n".join(lines)
+
+    import base64
+    import shlex
+    from .config import ClusterConfig
+    from .transport import Transport
+    try:
+        cluster = ClusterConfig.resolve(t)
+        transport = Transport.from_cluster(cluster)
+        encoded = base64.b64encode(_REMOTE_SUMMARY_SRC.encode("utf-8")).decode("ascii")
+        cmd = ("python3 -c "
+               + shlex.quote(f"import base64;exec(base64.b64decode('{encoded}').decode())")
+               + f" {shlex.quote(ws)} {int(max_files)} {int(max_bytes)}")
+        res = transport.exec(cmd)
+        if res.ok:
+            return res.out.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None,
                target: str | None = None, model: str | None = None,
-               engine: str | None = None) -> dict:
-    ctx = workspace_summary(workspace) if workspace else ""
+               engine: str | None = None, workspace_target: str | None = None) -> dict:
+    # Context comes from the machine that owns the workspace, not the model host.
+    ws_host = state.cluster_path(workspace_target) if workspace_target else "local"
+    ctx = workspace_summary(workspace, workspace_target=ws_host) if workspace else ""
     sys = ("You are a planning assistant. Given a goal, produce a concrete, ordered, checkable "
            "plan. The plan is carried out by an AUTONOMOUS agent that has file read/write and "
            "shell tools -- NOT a human at a GUI. Steps must be concrete agent actions (write a "
@@ -627,7 +687,8 @@ def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None
            "\"tests\": str (a shell command that genuinely verifies success via exit code -- e.g. "
            "grep/diff/an assertion script, NOT a bare echo/print that always succeeds, or \"\"), "
            "\"artifacts\": [str, ...]}. Steps are short imperative lines. No prose outside JSON.")
-    user = (_runtime_preamble(workspace, target=target, model=model, engine=engine)
+    user = (_runtime_preamble(workspace, target=target, model=model, engine=engine,
+                              workspace_target=workspace_target)
             + "\n\n" + f"Goal:\n{goal}\n\n"
             + (f"Workspace context:\n{ctx}\n\n" if ctx else "") + "Return the JSON plan.")
     msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
@@ -647,7 +708,7 @@ def draft_plan(state: State, goal: str, workspace: str | None, on_reasoning=None
 
 def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=None,
                 target: str | None = None, model: str | None = None,
-                engine: str | None = None) -> dict:
+                engine: str | None = None, workspace_target: str | None = None) -> dict:
     steps = [ln["text"] for ln in plan.get("lines", [])]
     rendered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
     cmts = "\n".join(
@@ -655,7 +716,10 @@ def refine_plan(state: State, plan: dict, comments: list[dict], on_reasoning=Non
         for c in comments) or "(no comments)"
     sys = ("Revise the plan to incorporate the user's comments. Reply STRICTLY as JSON: "
            "{\"title\": str, \"steps\": [str], \"tests\": str, \"artifacts\": [str]}.")
-    user = (f"Goal:\n{plan.get('goal', '')}\n\nCurrent plan:\n{rendered}\n\n"
+    user = (_runtime_preamble(target=target, model=model, engine=engine,
+                              workspace_target=workspace_target)
+            + "\n\n"
+            + f"Goal:\n{plan.get('goal', '')}\n\nCurrent plan:\n{rendered}\n\n"
             f"Tests: {plan.get('tests', '')}\nArtifacts: {plan.get('artifacts', [])}\n\n"
             f"User comments:\n{cmts}\n\nReturn the revised JSON plan.")
     msgs = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
@@ -725,7 +789,8 @@ def _fallback_steps(text: str) -> list[str]:
 # jobs
 # --------------------------------------------------------------------------- #
 def plan_to_yaml(plan: dict, workspace: str, model: str | None = None,
-                 engine: str | None = None) -> str:
+                 engine: str | None = None,
+                 model_config: ModelConfig | None = None) -> str:
     import yaml
     doc = {
         "title": plan.get("title", "agentica job"),
@@ -737,9 +802,16 @@ def plan_to_yaml(plan: dict, workspace: str, model: str | None = None,
         "max_iterations": 3,
         "max_steps_per_iteration": 12,
     }
-    if model:
-        doc["model"] = {"engine": engine or ("vllm" if "/" in model else "ollama"),
-                        "name": model}
+    resolved_model = model_config
+    if resolved_model is None and model:
+        resolved_model = ModelConfig(
+            engine=engine or ("vllm" if "/" in model else "ollama"),
+            name=model,
+        )
+    if resolved_model is not None:
+        # Preserve serving/tuning fields (quantization, parallelism, context,
+        # timeout, port), not just engine/name. Remote runners consume all of them.
+        doc["model"] = asdict(resolved_model)
     return yaml.safe_dump(doc, sort_keys=False)
 
 
@@ -784,41 +856,87 @@ def submit_local(state: State, plan: dict, workspace: str, model: str | None = N
             tests_authoritative=bool(plan.get("tests_authoritative", True)),
         ),
         max_iterations=3, max_steps_per_iteration=12)
+    cancel = threading.Event()
     rec = {"local_id": local_id, "target": "local", "status": "running",
-           "workspace": ws, "log": [], "outcome": None}
+           "workspace": ws, "log": [], "outcome": None, "cancel": cancel}
     state.local_jobs[local_id] = rec
+    _persist_local_job(state.db_path, rec)
 
     def runner():
         def note(msg):
             rec["log"].append(msg)
+            _persist_local_job(state.db_path, rec)
         try:
             selected_model = model or state.resolve_model()
             selected_engine = engine or ("vllm" if "/" in selected_model else "ollama")
             if selected_engine != "ollama":
-                raise RuntimeError("local jobs currently support Ollama models only")
+                raise RuntimeError(
+                    "local jobs currently support Ollama models only "
+                    "(pick an Ollama tag in the sidebar, or submit to a remote worker)"
+                )
             outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
                               provider="ollama", model_name=selected_model,
-                              ollama_host=state.ollama_host, model_timeout=300, _print=note)
-            rec["outcome"] = outcome.to_dict()
-            rec["status"] = "passed" if outcome.passed else "failed"
+                              ollama_host=state.ollama_host, model_timeout=300, _print=note,
+                              cancel_event=cancel)
+            # Persist BEFORE flipping in-memory status so waiters that observe a
+            # terminal status always find it already written to SQLite.
+            snap = dict(rec)
+            snap["outcome"] = outcome.to_dict()
+            snap["status"] = "cancelled" if cancel.is_set() else (
+                "passed" if outcome.passed else "failed"
+            )
+            # cancel Event is not JSON-serializable; strip for the snapshot.
+            snap.pop("cancel", None)
+            _persist_local_job(state.db_path, snap)
+            rec["outcome"] = snap["outcome"]
+            rec["status"] = snap["status"]
         except Exception as exc:  # noqa: BLE001
-            rec["status"] = "error"
-            rec["log"].append(f"ERROR {type(exc).__name__}: {exc}")
+            snap = dict(rec)
+            snap["status"] = "cancelled" if cancel.is_set() else "error"
+            snap["log"] = list(rec.get("log") or []) + [f"ERROR {type(exc).__name__}: {exc}"]
+            snap.pop("cancel", None)
+            _persist_local_job(state.db_path, snap)
+            rec["log"] = snap["log"]
+            rec["status"] = snap["status"]
 
     threading.Thread(target=runner, daemon=True).start()
-    return {"local": True, "local_id": local_id, "target": "local", "workspace": ws}
+    return {"local": True, "local_id": local_id, "target": "local", "workspace": ws,
+            "workspace_target": "local"}
 
 
 def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str,
-                  model: str | None = None, engine: str | None = None) -> dict:
+                  model: str | None = None, engine: str | None = None,
+                  workspace_source: str | None = None) -> dict:
     """Write a plan.yaml and submit to a ssh/SLURM target via job.submit. ``target``
     is the display name shown/polled by the UI; ``cluster_path`` is the cluster.yaml
-    (full SLURM config) or a bare ssh alias to actually connect with."""
+    (full SLURM config) or a bare ssh alias to actually connect with.
+
+    ``workspace_source`` decides what the remote agent works on: "local" stages a
+    snapshot of the local ``workspace`` directory into the per-job dir (results can
+    be rsynced back afterwards -- ``sync_to`` in the response); "remote" runs
+    against ``workspace`` as an existing path on the target machine."""
+    source = workspace_source or "local"
+    cluster = ClusterConfig.resolve(cluster_path)
+    selected_model = model or cluster.model.name
+    selected_engine = engine or (
+        cluster.model.engine if selected_model == cluster.model.name
+        else ("vllm" if "/" in selected_model else "ollama")
+    )
+    model_config = _model_config_for_selection(
+        cluster.model, selected_model, selected_engine,
+    )
     tmp = Path(tempfile.mkdtemp(prefix="agentica-plan-"))
     plan_path = tmp / "plan.yaml"
-    plan_path.write_text(plan_to_yaml(plan, workspace or "./workspace", model, engine), encoding="utf-8")
     captured: list[str] = []
-    rc = job.submit(cluster_path, str(plan_path), sync_code=True, _print=captured.append)
+    try:
+        plan_path.write_text(
+            plan_to_yaml(plan, workspace or "./workspace", model_config=model_config),
+            encoding="utf-8",
+        )
+        rc = job.submit(cluster_path, str(plan_path), sync_code=True,
+                        workspace_source=source, _print=captured.append)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     jobid = jobdir = None
     for line in captured:
         if "job_id=" in line:
@@ -827,8 +945,200 @@ def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str,
                     jobid = tok.split("=", 1)[1]
                 if tok.startswith("jobdir="):
                     jobdir = tok.split("=", 1)[1]
+    if rc != 0:
+        detail = captured[-1] if captured else "no submission details"
+        raise RuntimeError(f"remote job submission failed (rc={rc}): {detail}")
+    if not jobid or not jobdir:
+        raise RuntimeError(
+            "remote job submission returned success without a complete job id/job directory"
+        )
+    # A staged local workspace can be synced back once the job finishes.
+    sync_to = None
+    if source == "local" and workspace and Path(workspace).expanduser().is_dir():
+        sync_to = str(Path(workspace).expanduser())
     return {"local": False, "target": target, "rc": rc, "job_id": jobid, "jobdir": jobdir,
-            "output": captured}
+            "output": captured, "workspace_target": source, "sync_to": sync_to}
+
+
+# --------------------------------------------------------------------------- #
+# stored transcripts (direct SQLite -- reading/deleting history must never build
+# an agent app or spin up a model runtime; every app variant shares this db)
+# --------------------------------------------------------------------------- #
+def _history_db(db_path: str):
+    import sqlite3
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _load_session_messages(db_path: str, session_id: str) -> list[dict]:
+    if not Path(db_path).exists():
+        return []
+    with _history_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)).fetchall()
+    return [{"role": r["role"], "content": r["content"]}
+            for r in rows if r["role"] in ("user", "assistant")]
+
+
+def _list_sessions(db_path: str) -> list[dict]:
+    """Stored sessions, newest first, titled by their first user message."""
+    if not Path(db_path).exists():
+        return []
+    with _history_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT s.session_id, s.created_at_unix, s.updated_at_unix,
+                   (SELECT content FROM messages m WHERE m.session_id = s.session_id
+                     AND m.role = 'user' ORDER BY m.id ASC LIMIT 1) AS first_user,
+                   (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id
+                     AND m.role IN ('user', 'assistant')) AS message_count
+            FROM sessions s ORDER BY s.updated_at_unix DESC
+            """).fetchall()
+    return [{"session_id": r["session_id"],
+             "title": (r["first_user"] or "").strip()[:80] or "(empty session)",
+             "messages": r["message_count"],
+             "created_at": r["created_at_unix"], "updated_at": r["updated_at_unix"]}
+            for r in rows]
+
+
+def _delete_sessions(db_path: str, session_ids: list | None, delete_all: bool) -> dict:
+    """Purge stored transcripts (messages/runs/steps/events) for the given
+    sessions, or every session when ``all`` is set. This is the backend half of
+    the UI's history cleanup -- localStorage covers only the renderer's copy."""
+    if not Path(db_path).exists():
+        return {"ok": True, "deleted": 0}
+    ids = [str(s) for s in (session_ids or []) if s]
+    if not ids and not delete_all:
+        return {"ok": False, "error": "pass session_ids or all=true"}
+    with _history_db(db_path) as conn:
+        if delete_all:
+            run_rows = conn.execute("SELECT run_id FROM runs").fetchall()
+            run_ids = [r["run_id"] for r in run_rows]
+            if run_ids:
+                marks = ",".join("?" * len(run_ids))
+                conn.execute(f"DELETE FROM steps WHERE run_id IN ({marks})", run_ids)
+            deleted = conn.execute("SELECT COUNT(*) c FROM sessions").fetchone()["c"]
+            conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM runs")
+            conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM sessions")
+        else:
+            marks = ",".join("?" * len(ids))
+            run_rows = conn.execute(
+                f"SELECT run_id FROM runs WHERE session_id IN ({marks})", ids).fetchall()
+            run_ids = [r["run_id"] for r in run_rows]
+            if run_ids:
+                rmarks = ",".join("?" * len(run_ids))
+                conn.execute(f"DELETE FROM steps WHERE run_id IN ({rmarks})", run_ids)
+            conn.execute(f"DELETE FROM events WHERE session_id IN ({marks})", ids)
+            conn.execute(f"DELETE FROM runs WHERE session_id IN ({marks})", ids)
+            conn.execute(f"DELETE FROM messages WHERE session_id IN ({marks})", ids)
+            cur = conn.execute(f"DELETE FROM sessions WHERE session_id IN ({marks})", ids)
+            deleted = cur.rowcount
+        conn.commit()
+    return {"ok": True, "deleted": deleted}
+
+
+# --------------------------------------------------------------------------- #
+# Local job persistence — survive backend restarts so the UI poll loop does
+# not land on "unknown local job" after Electron relaunches the API process.
+# --------------------------------------------------------------------------- #
+def _ensure_local_jobs_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_jobs (
+            local_id TEXT PRIMARY KEY,
+            target TEXT,
+            status TEXT,
+            workspace TEXT,
+            log_json TEXT,
+            outcome_json TEXT,
+            updated_at_unix REAL
+        )
+        """
+    )
+
+
+def _persist_local_job(db_path: str, rec: dict) -> None:
+    if not db_path:
+        return
+    try:
+        import json as _json
+        import time as _time
+
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with _history_db(db_path) as conn:
+            _ensure_local_jobs_table(conn)
+            conn.execute(
+                """
+                INSERT INTO local_jobs(local_id, target, status, workspace, log_json, outcome_json, updated_at_unix)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(local_id) DO UPDATE SET
+                    status = excluded.status,
+                    workspace = excluded.workspace,
+                    log_json = excluded.log_json,
+                    outcome_json = excluded.outcome_json,
+                    updated_at_unix = excluded.updated_at_unix
+                """,
+                (
+                    rec.get("local_id"),
+                    rec.get("target", "local"),
+                    rec.get("status", "running"),
+                    rec.get("workspace", ""),
+                    _json.dumps(list(rec.get("log") or [])[-200:], default=str),
+                    _json.dumps(rec.get("outcome"), default=str) if rec.get("outcome") is not None else None,
+                    _time.time(),
+                ),
+            )
+            conn.commit()
+    except Exception:  # noqa: BLE001 - persistence must never break the job runner
+        pass
+
+
+def _load_local_jobs(db_path: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not db_path or not Path(db_path).exists():
+        return out
+    try:
+        import json as _json
+
+        with _history_db(db_path) as conn:
+            _ensure_local_jobs_table(conn)
+            rows = conn.execute(
+                "SELECT local_id, target, status, workspace, log_json, outcome_json FROM local_jobs"
+            ).fetchall()
+        for row in rows:
+            status = row["status"] or "error"
+            # In-flight jobs cannot continue after a process restart.
+            if status in {"running", "cancelling", "submitting"}:
+                status = "error"
+            log = []
+            try:
+                log = _json.loads(row["log_json"] or "[]")
+            except Exception:  # noqa: BLE001
+                log = []
+            if status == "error" and not any("interrupted by backend restart" in str(x) for x in log):
+                log = list(log) + ["interrupted by backend restart"]
+            outcome = None
+            if row["outcome_json"]:
+                try:
+                    outcome = _json.loads(row["outcome_json"])
+                except Exception:  # noqa: BLE001
+                    outcome = None
+            out[row["local_id"]] = {
+                "local_id": row["local_id"],
+                "target": row["target"] or "local",
+                "status": status,
+                "workspace": row["workspace"] or "",
+                "log": log,
+                "outcome": outcome,
+                "cancel": None,  # cannot resume a cancelled Event across restarts
+            }
+    except Exception:  # noqa: BLE001
+        return out
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -914,6 +1224,7 @@ def start_ollama(host: str, timeout_s: float = 25.0) -> tuple[bool, str]:
     p = urlparse(host)
     env = dict(os.environ)
     env["OLLAMA_HOST"] = f"{p.hostname or '127.0.0.1'}:{p.port or 11434}"
+    env.setdefault("OLLAMA_KEEP_ALIVE", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
     # Only point the dynamic loader at our provisioned libs when we're starting our
     # provisioned binary (a system ollama brings its own).
     lib = _provisioned_ollama_lib()
@@ -1127,77 +1438,95 @@ def make_handler(state: State):
             # data dir, streaming progress — same UX as the Ollama installer.
             self._sse_start()
             from .voice_provision import install_voice, voice_status
-            ok = install_voice(lambda m: self._safe_sse({"status": m}))
+
+            def _progress(msg):
+                if isinstance(msg, dict):
+                    self._safe_sse(msg)
+                else:
+                    self._safe_sse({"status": msg, "message": msg})
+
+            ok = install_voice(_progress)
             self._safe_sse({"done": True, "ok": ok, **voice_status()})
 
         def _stream_chat(self, body):
             self._sse_start()
             message = (body.get("message") or "").strip()
-            mode = body.get("mode", "agentic")
             ws = body.get("workspace")
             target = body.get("target", "local")
             model = body.get("model")
             engine = body.get("engine")
+            workspace_target = body.get("workspace_target", "local")
             try:
-                if mode == "plain":
-                    msgs = [{"role": "system", "content": _runtime_preamble(
-                        ws, target=target, model=model, engine=engine,
-                    )}]
-                    if ws:
-                        ctx = workspace_summary(ws)
-                        if ctx:
-                            msgs.append({"role": "system", "content": "Workspace context:\n" + ctx})
-                    msgs.append({"role": "user", "content": message})
-                    # think=False -> direct, fast answers (the reasoning model otherwise
-                    # streams a long chain-of-thought before any content, on even trivial
-                    # prompts). Reasoning is still forwarded if a model emits it.
-                    state.complete_stream(
-                        msgs,
-                        on_reasoning=lambda t: self._safe_sse({"reasoning": t}),
-                        on_content=lambda t: self._safe_sse({"delta": t}),
-                        think=False, target=target, model=model, engine=engine,
-                        on_status=lambda t: self._safe_sse({"status": t}))
-                    self._sse({"done": True})
-                else:
-                    app = state.app_for(
-                        ws, target=target, model=model, engine=engine,
-                        notify=lambda t: self._safe_sse({"status": t}),
-                    )
-                    # Stream per-step {step}/{artifact} frames as tools fire (the
-                    # loop used to run monolithically -> a blank wait until done),
-                    # then the authoritative terminal frame replaces them.
-                    # WATCHDOG: run the turn on a worker and heartbeat from here.
-                    # A frozen-build race once wedged this path with the client
-                    # seeing NOTHING forever — a turn may be slow, but the stream
-                    # must always be live and always end.
-                    box: dict = {}
+                if not message:
+                    raise ValueError("message required")
+                # Every chat turn is agentic -- there is no plain-completion mode.
+                # ("mode" in the body is accepted and ignored for older clients.)
+                app = state.app_for(
+                    ws, target=target, model=model, engine=engine,
+                    workspace_target=workspace_target,
+                    notify=lambda t: self._safe_sse({"status": t}),
+                )
+                # Stream per-step {step}/{artifact} frames as tools fire (the
+                # loop used to run monolithically -> a blank wait until done),
+                # then the authoritative terminal frame replaces them.
+                # WATCHDOG: run the turn on a worker and heartbeat from here.
+                # A frozen-build race once wedged this path with the client
+                # seeing NOTHING forever — a turn may be slow, but the stream
+                # must always be live and always end.
+                box: dict = {}
+                approval_id = uuid.uuid4().hex
 
-                    def _turn():
-                        try:
-                            box["res"] = stream_agent_turn(
-                                app, message, body.get("session_id"),
-                                emit=lambda frame: self._safe_sse(frame),
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            box["err"] = exc
+                def _approval_callback(call, decision):
+                    ev = threading.Event()
+                    state.pending_approvals[approval_id] = {
+                        "event": ev, "result": None,
+                        "tool": getattr(call, "name", None),
+                        "arguments": getattr(call, "arguments", {}) or {},
+                        "reason": getattr(decision, "reason", ""),
+                    }
+                    self._safe_sse({
+                        "approval_required": True,
+                        "approval_id": approval_id,
+                        "tool": getattr(call, "name", None),
+                        "arguments": getattr(call, "arguments", {}) or {},
+                        "reason": getattr(decision, "reason", ""),
+                    })
+                    # Wait up to 10 minutes for the UI to approve/deny.
+                    if not ev.wait(600):
+                        state.pending_approvals.pop(approval_id, None)
+                        return False
+                    pending = state.pending_approvals.pop(approval_id, {})
+                    return bool(pending.get("result"))
 
-                    worker = threading.Thread(target=_turn, daemon=True,
-                                              name="agentica-http-turn")
-                    worker.start()
-                    deadline = time.time() + 180
-                    while worker.is_alive() and time.time() < deadline:
-                        worker.join(2.0)
-                        if worker.is_alive():
-                            self._safe_sse({"ping": True})  # liveness; UI ignores it
+                def _turn():
+                    try:
+                        box["res"] = stream_agent_turn(
+                            app, message, body.get("session_id"),
+                            emit=lambda frame: self._safe_sse(frame),
+                            approval_callback=_approval_callback,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        box["err"] = exc
+
+                worker = threading.Thread(target=_turn, daemon=True,
+                                          name="agentica-http-turn")
+                worker.start()
+                deadline = time.time() + 180
+                while worker.is_alive() and time.time() < deadline:
+                    worker.join(2.0)
                     if worker.is_alive():
-                        self._safe_sse({"error": "the agent took too long and was stopped",
-                                        "done": True})
-                    elif "err" in box:
-                        self._safe_sse({"error": str(box["err"]), "done": True})
-                    else:
-                        res = box.get("res") or {}
-                        self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
-                                   "session_id": res.get("session_id"), "done": True})
+                        self._safe_sse({"ping": True})  # liveness; UI ignores it
+                if worker.is_alive():
+                    self._safe_sse({"error": "the agent took too long and was stopped",
+                                    "done": True})
+                elif "err" in box:
+                    self._safe_sse({"error": str(box["err"]), "done": True})
+                else:
+                    res = box.get("res") or {}
+                    self._sse({"final": res.get("final_answer"), "steps": res.get("steps", []),
+                               "session_id": res.get("session_id"),
+                               "target": target, "workspace_target": workspace_target,
+                               "done": True})
             except Exception as exc:  # noqa: BLE001
                 self._safe_sse({"error": str(exc), "done": True})
 
@@ -1219,12 +1548,14 @@ def make_handler(state: State):
                         state, body.get("goal", ""), body.get("workspace"), on_reasoning=on_r,
                         target=body.get("target"), model=body.get("model"),
                         engine=body.get("engine"),
+                        workspace_target=body.get("workspace_target"),
                     )
                 else:
                     plan = refine_plan(
                         state, body.get("plan", {}), body.get("comments", []), on_reasoning=on_r,
                         target=body.get("target"), model=body.get("model"),
                         engine=body.get("engine"),
+                        workspace_target=body.get("workspace_target"),
                     )
                 self._sse({"plan": plan, "done": True})
             except Exception as exc:  # noqa: BLE001
@@ -1257,17 +1588,13 @@ def make_handler(state: State):
                               for name, c in sorted(state.clusters.items())]
                     return self._json({"hosts": hosts, "default_model": state.model})
                 if u.path == "/api/history":
+                    # Storage-only: reading a transcript must never spin up a
+                    # remote model runtime (all app variants share state.db_path).
                     sid = (q.get("session_id") or [""])[0]
-                    ws = (q.get("workspace") or [None])[0]
-                    app = state.app_for(
-                        ws,
-                        target=(q.get("target") or ["local"])[0],
-                        model=(q.get("model") or [None])[0],
-                        engine=(q.get("engine") or [None])[0],
-                    )
-                    msgs = app.storage.load_messages(sid) if sid else []
-                    return self._json({"messages": [{"role": m.role, "content": m.content}
-                                                    for m in msgs if m.role in ("user", "assistant")]})
+                    msgs = _load_session_messages(state.db_path, sid) if sid else []
+                    return self._json({"messages": msgs})
+                if u.path == "/api/sessions":
+                    return self._json({"sessions": _list_sessions(state.db_path)})
                 if u.path == "/api/job/status":
                     return self._json(self._job_status(q))
                 if u.path == "/api/job/logs":
@@ -1304,6 +1631,16 @@ def make_handler(state: State):
                     return self._json(self._chat(body))
                 if u.path == "/api/chat/stream":
                     return self._stream_chat(body)
+                if u.path == "/api/approve":
+                    aid = body.get("approval_id") or ""
+                    pending = state.pending_approvals.get(aid)
+                    if not pending:
+                        return self._json({"ok": False, "error": "unknown or expired approval"}, 404)
+                    pending["result"] = bool(body.get("approved", False))
+                    ev = pending.get("event")
+                    if ev is not None:
+                        ev.set()
+                    return self._json({"ok": True, "approved": pending["result"]})
                 if u.path == "/api/ollama/start":
                     ok, msg = start_ollama(state.ollama_host)
                     return self._json({"ok": ok, "message": msg, **setup_status(state)})
@@ -1314,6 +1651,7 @@ def make_handler(state: State):
                         state, body.get("goal", ""), body.get("workspace"),
                         target=body.get("target"), model=body.get("model"),
                         engine=body.get("engine"),
+                        workspace_target=body.get("workspace_target"),
                     ))
                 if u.path == "/api/plan/draft/stream":
                     return self._stream_plan(body, "draft")
@@ -1322,6 +1660,7 @@ def make_handler(state: State):
                         state, body.get("plan", {}), body.get("comments", []),
                         target=body.get("target"), model=body.get("model"),
                         engine=body.get("engine"),
+                        workspace_target=body.get("workspace_target"),
                     ))
                 if u.path == "/api/plan/refine/stream":
                     return self._stream_plan(body, "refine")
@@ -1329,10 +1668,13 @@ def make_handler(state: State):
                     return self._json(self._submit(body))
                 if u.path == "/api/job/cancel":
                     return self._json(self._cancel(body))
+                if u.path == "/api/job/fetch":
+                    return self._json(self._job_fetch(body))
+                if u.path == "/api/sessions/delete":
+                    return self._json(_delete_sessions(
+                        state.db_path, body.get("session_ids"), bool(body.get("all"))))
                 if u.path == "/api/voice/install":
                     return self._stream_voice_install()
-                if u.path == "/api/voice/gemini/token":
-                    return self._json(self._gemini_token(body))
                 return self._json({"error": "not found"}, 404)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": type(exc).__name__, "message": str(exc)}, 500)
@@ -1342,32 +1684,20 @@ def make_handler(state: State):
             message = (body.get("message") or "").strip()
             if not message:
                 raise ValueError("message required")
-            mode = body.get("mode", "agentic")
             ws = body.get("workspace")
             target = body.get("target", "local")
             model = body.get("model")
             engine = body.get("engine")
-            if mode == "plain":
-                msgs = [{"role": "system", "content": _runtime_preamble(
-                    ws, target=target, model=model, engine=engine,
-                )}]
-                if ws:
-                    ctx = workspace_summary(ws)
-                    if ctx:
-                        msgs.append({"role": "system",
-                                     "content": "Use this workspace as context:\n" + ctx})
-                msgs.append({"role": "user", "content": message})
-                return {"mode": "plain",
-                        "final_answer": state.complete(
-                            msgs, target=target, model=model, engine=engine,
-                        ),
-                        "steps": [], "target": target, "model": model, "engine": engine}
-            app = state.app_for(ws, target=target, model=model, engine=engine)
+            workspace_target = body.get("workspace_target", "local")
+            # Agentic-only: every conversational turn runs the tool loop.
+            app = state.app_for(ws, target=target, model=model, engine=engine,
+                                workspace_target=workspace_target)
             res = app.chat(message, body.get("session_id"))
             return {"mode": "agentic", "session_id": res.get("session_id"),
                     "final_answer": res.get("final_answer"), "steps": res.get("steps", []),
                     "transcript": res.get("transcript", []),
-                    "target": target, "model": model, "engine": engine}
+                    "target": target, "workspace_target": workspace_target,
+                    "model": model, "engine": engine}
 
         def _submit(self, body):
             plan = body.get("plan") or {}
@@ -1375,39 +1705,80 @@ def make_handler(state: State):
             ws = body.get("workspace") or plan.get("workspace") or ""
             model = body.get("model")
             engine = body.get("engine")
+            workspace_target = (body.get("workspace_target") or "local").strip() or "local"
             if target == "local":
+                if workspace_target != "local":
+                    raise ValueError(
+                        "a job running locally cannot use a remote workspace -- "
+                        "pick the same machine as the worker, or run the job there")
                 return submit_local(state, plan, ws, model=model, engine=engine)
+            # The worker is remote. A LOCAL workspace is snapshotted to the worker
+            # (and can be synced back on completion); a workspace on the WORKER runs
+            # in place. A third machine is not supported.
+            if workspace_target == "local":
+                source = "local"
+            elif state.cluster_path(workspace_target) == state.cluster_path(target):
+                source = "remote"
+            else:
+                raise ValueError(
+                    f"workspace machine {workspace_target!r} must be 'local' or the "
+                    f"worker machine {target!r}")
             # Map a cluster-name target to its cluster.yaml (account/partition/setup);
             # a bare ssh alias passes through unchanged.
             return submit_remote(plan, target, state.cluster_path(target), ws,
-                                 model=model, engine=engine)
-
-        def _gemini_token(self, body):
-            # Mint an ephemeral Gemini Live token so the renderer can open a
-            # realtime audio WebSocket directly to Google (cloud voice engine).
-            # The key is supplied by the user (request body) or env; we only mint
-            # a short-lived token, we don't persist the key. The agent turn +
-            # canvas stay local. Returns {error} (not a 500) when no key is given.
-            key = (body.get("api_key") or os.environ.get("GEMINI_API_KEY")
-                   or os.environ.get("GOOGLE_API_KEY"))
-            if not key:
-                return {"error": "Add your Gemini API key in Settings to use the cloud voice engine."}
-            try:
-                from agentic_loop.voice_adapters import GeminiLiveTokenClient
-                client = GeminiLiveTokenClient(api_key=key)
-                return client.create_token(body.get("purpose", "voice"), body.get("session_id"))
-            except Exception as exc:  # noqa: BLE001
-                return {"error": str(exc)}
+                                 model=model, engine=engine, workspace_source=source)
 
         def _cancel(self, body):
-            # Remote jobs: scancel (SLURM) / best-effort kill (ssh). Local jobs run in an
-            # in-process thread that can't be interrupted -- the UI just dismisses the panel.
+            # Local jobs: cooperative cancel (checked between loop phases).
+            local_id = body.get("local_id") or ""
+            if local_id:
+                rec = state.local_jobs.get(local_id)
+                if not rec:
+                    return {"ok": False, "error": "unknown local job"}
+                current = rec.get("status", "running")
+                if current == "cancelled":
+                    return {"ok": True, "status": "cancelled",
+                            "lines": ["job is already cancelled"]}
+                if current in {"passed", "failed", "error"}:
+                    return {"ok": False, "status": current,
+                            "error": f"job already finished with status {current}"}
+                cancel = rec.get("cancel")
+                if cancel is None:
+                    return {"ok": False, "error": "this job cannot be cancelled"}
+                if cancel.is_set():
+                    return {"ok": True, "status": "cancelling",
+                            "lines": ["cancellation is already pending"]}
+                cancel.set()
+                rec["status"] = "cancelling"
+                rec["log"].append("cancel requested — stopping at the next phase boundary")
+                _persist_local_job(state.db_path, rec)
+                return {"ok": True, "status": "cancelling",
+                        "lines": ["cancel requested; the job stops at the next phase boundary"]}
+            # Remote jobs: scancel (SLURM) / kill the runner PID (ssh).
             jid = body.get("job") or ""
             if not jid:
-                return {"ok": False, "error": "cancel needs a remote job id"}
+                return {"ok": False, "error": "cancel needs a job id"}
             out: list[str] = []
-            rc = job.cancel(state.cluster_path(body.get("target", "")), jid, _print=out.append)
-            return {"ok": rc == 0, "status": "cancelled", "lines": out}
+            rc = job.cancel(state.cluster_path(body.get("target", "")), jid,
+                            jobdir=body.get("jobdir"), _print=out.append)
+            if rc == 0:
+                return {"ok": True, "status": "cancelled", "lines": out}
+            return {"ok": False, "status": "error", "lines": out,
+                    "error": out[-1] if out else "remote cancellation failed"}
+
+        def _job_fetch(self, body):
+            # Sync a finished remote job's staged workspace back into the local
+            # directory it was snapshotted from (the UI passes sync_to from submit).
+            target = body.get("target") or ""
+            jobdir = body.get("jobdir") or ""
+            dest = body.get("dest") or ""
+            if not (target and jobdir and dest):
+                return {"ok": False, "synced": False,
+                        "error": "fetch needs target, jobdir and dest"}
+            out: list[str] = []
+            rc = job.fetch_artifacts(state.cluster_path(target), jobdir, dest,
+                                     _print=out.append)
+            return {"ok": rc == 0, "synced": rc == 0, "lines": out}
 
         def _job_status(self, q):
             local_id = (q.get("local_id") or [None])[0]
@@ -1434,7 +1805,9 @@ def make_handler(state: State):
             jid = (q.get("job") or [""])[0]
             jobdir = (q.get("jobdir") or [None])[0]
             out: list[str] = []
-            job.logs(target, jid, jobdir=jobdir, _print=out.append)
+            # cluster_path: a cluster-name target must resolve to its cluster.yaml
+            # here just like status/cancel (a bare ssh alias passes through).
+            job.logs(state.cluster_path(target), jid, jobdir=jobdir, _print=out.append)
             return {"log": out}
 
     return H
