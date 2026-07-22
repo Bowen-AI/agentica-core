@@ -28,8 +28,8 @@ def test_setup_status(monkeypatch):
     assert s["models"] == ["gemma4:e4b", "qwen3.5:9b"]
 
     s2 = apiserver.setup_status(_state("not-pulled:7b"))
-    # configured model absent, but other models exist -> still READY (resolve_model uses one)
-    assert s2["ollama_running"] and not s2["model_present"] and s2["ready"]
+    # configured default absent -> not ready (first-run pulls that tag so Chat works immediately)
+    assert s2["ollama_running"] and not s2["model_present"] and not s2["ready"]
 
 
 def test_setup_status_not_ready_with_no_models(monkeypatch):

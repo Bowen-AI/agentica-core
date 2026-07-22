@@ -1205,9 +1205,10 @@ def setup_status(state: "State") -> dict:
             "models": models,
             "model": state.model,
             "model_present": present,
-            # Ready once Ollama is up and ANY model is installed -- resolve_model()
-            # will use an existing model, so we only need to pull when there are none.
-            "ready": running and bool(models),
+            # Ready once Ollama is up and the configured default model is installed.
+            # First-run / install.sh pull that tag so Chat works immediately; Skip in
+            # the UI still lets power users proceed with another local model.
+            "ready": running and present,
         }
     except Exception as exc:  # noqa: BLE001
         return {"ollama_installed": False, "ollama_running": False, "models": [],
