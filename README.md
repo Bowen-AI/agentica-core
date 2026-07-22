@@ -27,7 +27,8 @@ The desktop API is agentic-only: every Chat and Voice request runs the tool loop
 
 Model inference and workspace tools are independent:
 
-- `target` is the **model machine**. It loads the selected Ollama or vLLM model.
+- `target` is the **model machine**. It loads the selected Ollama, vLLM, or MLX
+  (`mlx` / `mlx-lm`) model.
 - `workspace_target` is the **workspace machine**. File and shell tools execute
   inside `workspace` on this machine and default to `local`.
 
@@ -69,6 +70,7 @@ GET  /api/job/status
 GET  /api/job/logs
 POST /api/job/cancel
 POST /api/job/fetch            sync a staged workspace back
+POST /api/approve              resolve a blocking tool-approval request
 
 GET  /api/voice/status
 POST /api/voice/install
@@ -76,6 +78,9 @@ POST /api/voice/install
 
 Set `AGENTICA_AUTH_TOKEN` to require the same local bearer token used by the
 packaged Electron app.
+
+Streaming prefers an in-process `on_event` callback into AgenticLocal when the
+pinned engine supports it; older pins fall back to SQLite event-tail polling.
 
 ## Local voice, optimized for response time
 
@@ -88,10 +93,12 @@ microphone → Silero VAD → Whisper → agent loop + tools → Kokoro → spea
 - Apple Silicon automatically prefers `mlx-whisper` `small.en` on Metal.
 - Other platforms use `faster-whisper` `base.en` with CPU int8.
 - Kokoro is the default open-weight TTS; Piper is a small fallback when present.
-- The gateway warms cached models in a background thread so the first live turn
-  does not also pay model construction time.
-- Weights are downloaded on first use under
-  `~/.local/share/agentica/voice`. Override that with `AGENTICA_VOICE_HOME`.
+- The gateway warms STT/TTS in a background thread at start; by default warmup
+  also provisions missing weights. Idle unload uses `AGENTICA_VOICE_IDLE_S`
+  (default 30 minutes).
+- Voice turns use `max_steps=4` and start TTS when `final_answer` arrives.
+- Weights live under `~/.local/share/agentica/voice` (override with
+  `AGENTICA_VOICE_HOME`).
 
 Useful controls:
 
@@ -102,6 +109,7 @@ agentica voice-selftest
 AGENTICA_STT_ENGINE=mlx agentica serve-api       # Apple Silicon + Metal
 AGENTICA_STT_ENGINE=faster agentica serve-api    # portable CPU path
 AGENTICA_WHISPER_MODEL=tiny.en agentica serve-api
+OLLAMA_KEEP_ALIVE=30m agentica serve-api         # default idle unload window
 python scripts/bench_voice.py                    # cold/warm STT + TTS timings
 ```
 
@@ -112,7 +120,8 @@ processed in memory and is not added to history.
 
 Each UI submission is an independent run. Submit the same plan to multiple
 workers and the app monitors them concurrently, records logs and output, supports
-cancellation, and keeps polling when the user changes views.
+cancellation, and keeps polling when the user changes views. Local jobs are
+persisted to SQLite so a backend restart can recover status for the UI poll loop.
 
 A remote run has two workspace modes:
 

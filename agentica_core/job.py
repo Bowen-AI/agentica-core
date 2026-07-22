@@ -125,7 +125,7 @@ def render_job_sbatch(
     setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
     if model.engine == "ollama":
         serve = f"""export OLLAMA_HOST=0.0.0.0:{port}
-export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_KEEP_ALIVE=${{OLLAMA_KEEP_ALIVE:-30m}}
 ollama serve &
 SERVE_PID=$!
 for i in $(seq 1 120); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
@@ -247,7 +247,7 @@ def _ssh_runner_script(
     setup = ("\n".join(cluster.setup) + "\n") if cluster.setup else ""
     if model.engine == "ollama":
         serve = f"""export OLLAMA_HOST=0.0.0.0:{port}
-export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_KEEP_ALIVE=${{OLLAMA_KEEP_ALIVE:-30m}}
 (curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 || (nohup ollama serve >{remote_jobdir}/ollama.log 2>&1 &))
 for i in $(seq 1 90); do curl -sf "http://127.0.0.1:{port}/api/tags" >/dev/null 2>&1 && break; sleep 1; done
 ollama pull "{model.name}" || echo "WARN: ollama pull failed (tag may exist)"

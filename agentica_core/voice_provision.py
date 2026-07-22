@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -314,6 +315,7 @@ def _to_float32_16k(pcm: bytes, sample_rate: int):
 
 def transcribe_pcm16(pcm: bytes, sample_rate: int = 16000) -> str:
     """Transcribe little-endian PCM16 mono audio to text with the active engine."""
+    _touch_voice_use()
     engine = stt_engine()
     if engine is None:
         raise VoiceUnavailable(
@@ -334,11 +336,21 @@ def transcribe_pcm16(pcm: bytes, sample_rate: int = 16000) -> str:
     return " ".join(seg.text for seg in segments).strip()
 
 
-def warmup() -> dict:
+def warmup(*, download_missing: bool = True) -> dict:
     """Pre-build the STT + TTS models so the FIRST voice turn doesn't pay lazy
     model construction (measured multi-second on cold start). Called from a
-    daemon thread at gateway start; never downloads missing weights."""
-    out = {"stt": False, "tts": False}
+    daemon thread at gateway start. When weights are missing and
+    ``download_missing`` is True, trigger provisioning first.
+    """
+    out = {"stt": False, "tts": False, "downloaded": False}
+    selected = stt_engine()
+    need_stt = bool(selected) and not _stt_model_ready(selected)
+    need_tts = not _kokoro_ready() and not (_piper_binary() and _piper_voice())
+    if download_missing and (need_stt or need_tts or selected is None):
+        try:
+            out["downloaded"] = bool(install_voice(lambda _m: None))
+        except Exception:  # noqa: BLE001
+            out["downloaded"] = False
     selected = stt_engine()
     if selected and _stt_model_ready(selected):
         try:
@@ -353,8 +365,44 @@ def warmup() -> dict:
         _load_kokoro()
         out["tts"] = True
     except Exception:  # noqa: BLE001
-        pass
+        # Piper may still be ready even if Kokoro isn't installed.
+        if _piper_binary() is not None and _piper_voice() is not None:
+            out["tts"] = True
     return out
+
+
+# Idle unload: release heavy STT/TTS globals after AGENTICA_VOICE_IDLE_S of
+# inactivity (default 30 minutes) so memory isn't pinned forever.
+_VOICE_IDLE_S = float(os.environ.get("AGENTICA_VOICE_IDLE_S", str(30 * 60)))
+_last_voice_use = 0.0
+_idle_timer: threading.Timer | None = None
+_idle_lock = threading.Lock()
+
+
+def _touch_voice_use() -> None:
+    global _last_voice_use, _idle_timer
+    _last_voice_use = time.time()
+    with _idle_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        if _VOICE_IDLE_S <= 0:
+            return
+        _idle_timer = threading.Timer(_VOICE_IDLE_S, unload_voice_models)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+
+def unload_voice_models() -> dict:
+    """Drop cached Whisper/Kokoro handles so RAM can be reclaimed."""
+    global _whisper_model, _kokoro, _idle_timer
+    with _load_lock:
+        _whisper_model = None
+        _kokoro = None
+    with _idle_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
+    return {"unloaded": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -409,6 +457,7 @@ def synthesize_pcm(text: str) -> tuple[bytes, int]:
     Kokoro is the natural default; Piper is the small, portable fallback. Voice
     mode deliberately never calls a remote/cloud TTS endpoint.
     """
+    _touch_voice_use()
     try:
         return synthesize_kokoro_pcm(text)
     except VoiceUnavailable:
@@ -501,23 +550,47 @@ def install_voice(progress=lambda m: None) -> bool:
 def _download_verified(url: str, dest: Path, progress, *, sha256: str | None = None, label: str = "") -> None:
     """Download to a temp file, verify sha256 (if pinned), then atomically rename.
     Never leaves a partial/poisoned file at ``dest``; never chmod/loads an
-    unverified asset when a hash is pinned."""
+    unverified asset when a hash is pinned. Reports byte-level progress when
+    Content-Length is available so the Voice UI can show a real progress bar.
+    """
     import hashlib
     import urllib.request
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     progress(f"downloading {label or dest.name}…")
-    urllib.request.urlretrieve(url, tmp)
+    req = urllib.request.Request(url, headers={"User-Agent": "agentica-voice"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        last_pct = -1
+        h = hashlib.sha256() if sha256 else None
+        with open(tmp, "wb") as fh:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                if h is not None:
+                    h.update(chunk)
+                done += len(chunk)
+                if total > 0:
+                    pct = int(100 * done / total)
+                    if pct != last_pct and (pct == 100 or pct - last_pct >= 2):
+                        last_pct = pct
+                        progress({
+                            "status": f"downloading {label or dest.name}",
+                            "completed": done,
+                            "total": total,
+                            "pct": pct,
+                        })
     if sha256:
-        h = hashlib.sha256()
-        with open(tmp, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        got = h.hexdigest()
+        got = h.hexdigest() if h is not None else ""
         if got != sha256.lower():
             tmp.unlink(missing_ok=True)
-            raise VoiceUnavailable(f"checksum mismatch for {dest.name}: expected {sha256[:12]}…, got {got[:12]}…")
+            raise VoiceUnavailable(
+                f"checksum mismatch for {dest.name}: expected {sha256[:12]}…, got {got[:12]}…"
+            )
     else:
         progress(f"warning: no pinned checksum for {dest.name} (trust-on-first-use)")
     os.replace(tmp, dest)

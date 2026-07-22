@@ -6,6 +6,7 @@ allocation, then either tunnel to it (gateway) or hit it on localhost (job).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from . import catalog
@@ -72,11 +73,17 @@ def render_serve_sbatch(cluster: ClusterConfig, remote_jobdir: str, model: Model
     return "\n".join(sbatch_lines) + "\n\n" + setup + body + "\n"
 
 
+def _ollama_keep_alive() -> str:
+    # Default 30m (was hardcoded 24h) so idle models can unload; override via env.
+    return os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
+
+
 def _ollama_serve_body(m: ModelConfig) -> str:
+    keep = _ollama_keep_alive()
     return f"""set -uo pipefail
 echo "SERVE_NODE=$(hostname)"
 export OLLAMA_HOST=0.0.0.0:{m.serve_port}
-export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_KEEP_ALIVE={keep}
 ollama serve &
 SERVE_PID=$!
 echo "waiting for ollama on :{m.serve_port}..."

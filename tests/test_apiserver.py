@@ -274,7 +274,7 @@ def test_stream_chat_forces_agentic_and_threads_workspace_target(monkeypatch):
     events = []
     streamed = {}
 
-    def fake_turn(app, message, session_id, emit):
+    def fake_turn(app, message, session_id, emit, **_kwargs):
         streamed.update(message=message, session_id=session_id)
         emit({"step": {"tool_name": "read_file"}})
         return {"session_id": "stream-session", "final_answer": "done", "steps": []}

@@ -1,10 +1,9 @@
 """On-node agentic job runner: Planner -> Executor -> Auditor outer loop.
 
-Runs INSIDE the SLURM allocation. The auditor is an explicit Python loop (NOT a
-policy hook -- AgenticLocal's requires_approval does not pause the loop). The
-deterministic backstops (test exit code + artifact existence) WIN over the model
-verdict; the auditor's structured ``submit_for_audit`` call is the only model
-signal that can additionally fail an otherwise-green run for incompleteness.
+Runs INSIDE the SLURM allocation. The auditor is an explicit Python loop.
+When ``cancel_event`` is set, cooperative cancel stops between phases and also
+mid-tool via ``AgentController.run(..., cancel_event=...)``. Blocking approvals
+are available when an ``approval_callback`` is wired into the controller.
 """
 
 from __future__ import annotations
@@ -108,7 +107,7 @@ def run_job(
     if (out := _cancelled("planner", 0)) is not None:
         return out
     note("[planner] producing plan...")
-    plan_result = controller.run(plan.goal, workflow_key="planner")
+    plan_result = controller.run(plan.goal, workflow_key="planner", cancel_event=cancel_event)
     plan_text = plan_result.final_answer or ""
     _checkpoint(checkpoint_dir, "planner", {"plan": plan_text})
 
@@ -121,7 +120,7 @@ def run_job(
         if (out := _cancelled(f"executor iteration {i}", i - 1, plan_text)) is not None:
             return out
         note(f"[executor] iteration {i}/{plan.max_iterations}")
-        controller.run(executor_goal, workflow_key="executor")
+        controller.run(executor_goal, workflow_key="executor", cancel_event=cancel_event)
 
         # Deterministic backstops (authoritative). Restore any tampered grader/fixture
         # files to their pristine copy first, then score against them.
@@ -138,6 +137,7 @@ def run_job(
         audit_result = controller.run(
             "Audit the work against the checklist and finish with submit_for_audit.",
             workflow_key="auditor",
+            cancel_event=cancel_event,
         )
         verdict, gaps = _extract_audit_verdict(audit_result)
         note(f"[auditor] verdict={verdict} gaps={gaps[:200]!r}")

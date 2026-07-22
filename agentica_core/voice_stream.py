@@ -1,26 +1,14 @@
 """Stream an agentic turn's per-step events as they happen.
 
-agentica-core's ``/api/chat/stream`` agentic branch (``apiserver._stream_chat``)
-historically called ``AgentServerApp.chat()``, which runs the whole
-Planner/tool loop monolithically and only returns at the very end -- so the UI
-saw no tool steps (and no visual artifacts) until the turn was over.
-
-``stream_agent_turn`` closes that gap WITHOUT modifying AgenticLocal: it runs
-``app.chat()`` in a worker thread and concurrently TAILS the SQLite event log
-that ``AgentController`` already writes during the run
-(``app.events(session_id, after_id)`` -> ``storage.events_after``). Each new
-event is translated into a UI frame (``{"step": ...}`` / ``{"artifact": ...}``)
-and handed to ``emit`` as the tool fires.
-
-We deliberately tail SQLite rather than adding a callback into
-``AgentController``: the packaged release ``pip install``s AgenticLocal from git
-``main``, so we depend only on surfaces already there
-(``create_session``, ``events`` -> ``events_after``). If those surfaces are
-absent (a much older engine), we degrade gracefully to a single final frame.
+Prefer an in-process ``on_event`` callback into ``AgentController.run`` (via
+``app.chat(..., on_event=...)``) so voice/chat UI frames arrive without a
+SQLite poll. Falls back to tailing ``app.events()`` when the engine does not
+accept ``on_event`` (older AgenticLocal pins).
 """
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from typing import Any, Callable
@@ -98,6 +86,19 @@ def translate_event(ev: dict[str, Any]) -> list[dict[str, Any]]:
             "tool_name": payload.get("tool"),
             "error": payload.get("reason"),
         }})
+        frames.append({"approval": {
+            "tool": payload.get("tool"),
+            "arguments": payload.get("arguments") or {},
+            "reason": payload.get("reason"),
+            "blocking": bool(payload.get("blocking")),
+        }})
+    elif event_type == "tools_unsupported":
+        frames.append({"step": {
+            "action": "tools_unsupported",
+            "error": payload.get("content"),
+        }})
+    elif event_type == "final_answer":
+        frames.append({"final_answer": payload.get("content") or ""})
     return frames
 
 
@@ -141,14 +142,46 @@ def _drain(app: Any, session_id: str, after_id: int, emit: Callable[[dict], None
             return after_id
 
 
-def _chat(app, message, session_id, cancel_event):
-    # Pass the cancel token if this engine supports it (AgenticLocal main may not).
-    if cancel_event is not None:
-        try:
-            return app.chat(message, session_id, cancel_event=cancel_event)
-        except TypeError:
-            pass
-    return app.chat(message, session_id)
+def _chat_supports(app, *names: str) -> bool:
+    chat = getattr(app, "chat", None)
+    if chat is None:
+        return False
+    try:
+        params = inspect.signature(chat).parameters
+    except (TypeError, ValueError):
+        return False
+    return all(name in params for name in names)
+
+
+def _chat(
+    app,
+    message,
+    session_id,
+    cancel_event,
+    *,
+    on_event=None,
+    max_steps=None,
+    approval_callback=None,
+):
+    kwargs: dict[str, Any] = {}
+    if cancel_event is not None and _chat_supports(app, "cancel_event"):
+        kwargs["cancel_event"] = cancel_event
+    if on_event is not None and _chat_supports(app, "on_event"):
+        kwargs["on_event"] = on_event
+    if max_steps is not None and _chat_supports(app, "max_steps"):
+        kwargs["max_steps"] = max_steps
+    if approval_callback is not None and _chat_supports(app, "approval_callback"):
+        kwargs["approval_callback"] = approval_callback
+    try:
+        return app.chat(message, session_id, **kwargs)
+    except TypeError:
+        # Older engines that reject unexpected kwargs.
+        if cancel_event is not None:
+            try:
+                return app.chat(message, session_id, cancel_event=cancel_event)
+            except TypeError:
+                pass
+        return app.chat(message, session_id)
 
 
 def stream_agent_turn(
@@ -159,38 +192,60 @@ def stream_agent_turn(
     *,
     poll_interval: float = 0.1,
     cancel_event=None,
+    max_steps: int | None = None,
+    approval_callback=None,
 ) -> dict[str, Any]:
     """Run an agentic turn, streaming per-step ``{step}``/``{artifact}`` frames.
 
-    ``emit`` is called (from the calling thread) for each incremental frame.
-    Returns the final ``app.chat`` payload (``final_answer``/``steps``/
-    ``session_id``) so the caller can send the authoritative terminal frame.
+    Prefers ``on_event`` (native callback) over SQLite polling when the engine
+    supports it. ``emit`` is called for each incremental frame. Returns the
+    final ``app.chat`` payload so the caller can send the terminal frame.
     """
     # Degrade gracefully on an engine without the tail surfaces.
     if not (hasattr(app, "events") and hasattr(app, "create_session")):
-        result = _chat(app, message, session_id, cancel_event)
+        result = _chat(
+            app, message, session_id, cancel_event,
+            max_steps=max_steps, approval_callback=approval_callback,
+        )
         result.setdefault("session_id", session_id)
         return result
 
     if not session_id:
         session_id = app.create_session()
-    after_id = _max_event_id(app, session_id)
 
+    use_callback = _chat_supports(app, "on_event")
+    after_id = 0 if use_callback else _max_event_id(app, session_id)
     box: dict[str, Any] = {}
+    seen_lock = threading.Lock()
+
+    def _on_event(ev: dict[str, Any]) -> None:
+        with seen_lock:
+            for frame in translate_event(ev):
+                emit(frame)
 
     def _worker():
         try:
-            box["result"] = _chat(app, message, session_id, cancel_event)
+            box["result"] = _chat(
+                app,
+                message,
+                session_id,
+                cancel_event,
+                on_event=_on_event if use_callback else None,
+                max_steps=max_steps,
+                approval_callback=approval_callback,
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller below
             box["error"] = exc
 
     worker = threading.Thread(target=_worker, name="agentica-chat-turn", daemon=True)
     worker.start()
     while worker.is_alive():
-        after_id = _drain(app, session_id, after_id, emit)
-        time.sleep(poll_interval)
-    # Final drain to catch the tail (the final_answer event + last tool result).
-    _drain(app, session_id, after_id, emit)
+        if not use_callback:
+            after_id = _drain(app, session_id, after_id, emit)
+        time.sleep(poll_interval if not use_callback else min(poll_interval, 0.05))
+    if not use_callback:
+        # Final drain to catch the tail (the final_answer event + last tool result).
+        _drain(app, session_id, after_id, emit)
 
     if "error" in box:
         raise box["error"]

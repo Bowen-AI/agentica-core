@@ -160,9 +160,11 @@ class State:
         self._apps: dict[tuple, object] = {}        # runtime/workspace -> AgentServerApp
         self._runtimes: dict[tuple[str, str, str], RuntimeBinding] = {}
         self._runtime_lock = threading.Lock()
-        self.local_jobs: dict[str, dict] = {}        # local_id -> {status, outcome, ...}
+        self.local_jobs: dict[str, dict] = _load_local_jobs(db_path)
         self._model_resolved = False
         self.clusters = load_clusters(clusters_dir)  # name -> {path, host, scheduler}
+        # Pending chat approvals: approval_id -> {"event": Event, "result": bool|None}
+        self.pending_approvals: dict[str, dict] = {}
 
     def cluster_path(self, target: str) -> str:
         """Map a target name to its cluster.yaml path if it's a known cluster, else
@@ -858,27 +860,44 @@ def submit_local(state: State, plan: dict, workspace: str, model: str | None = N
     rec = {"local_id": local_id, "target": "local", "status": "running",
            "workspace": ws, "log": [], "outcome": None, "cancel": cancel}
     state.local_jobs[local_id] = rec
+    _persist_local_job(state.db_path, rec)
 
     def runner():
         def note(msg):
             rec["log"].append(msg)
+            _persist_local_job(state.db_path, rec)
         try:
             selected_model = model or state.resolve_model()
             selected_engine = engine or ("vllm" if "/" in selected_model else "ollama")
             if selected_engine != "ollama":
-                raise RuntimeError("local jobs currently support Ollama models only")
+                raise RuntimeError(
+                    "local jobs currently support Ollama models only "
+                    "(pick an Ollama tag in the sidebar, or submit to a remote worker)"
+                )
             outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
                               provider="ollama", model_name=selected_model,
                               ollama_host=state.ollama_host, model_timeout=300, _print=note,
                               cancel_event=cancel)
-            rec["outcome"] = outcome.to_dict()
-            if cancel.is_set():
-                rec["status"] = "cancelled"
-            else:
-                rec["status"] = "passed" if outcome.passed else "failed"
+            # Persist BEFORE flipping in-memory status so waiters that observe a
+            # terminal status always find it already written to SQLite.
+            snap = dict(rec)
+            snap["outcome"] = outcome.to_dict()
+            snap["status"] = "cancelled" if cancel.is_set() else (
+                "passed" if outcome.passed else "failed"
+            )
+            # cancel Event is not JSON-serializable; strip for the snapshot.
+            snap.pop("cancel", None)
+            _persist_local_job(state.db_path, snap)
+            rec["outcome"] = snap["outcome"]
+            rec["status"] = snap["status"]
         except Exception as exc:  # noqa: BLE001
-            rec["status"] = "cancelled" if cancel.is_set() else "error"
-            rec["log"].append(f"ERROR {type(exc).__name__}: {exc}")
+            snap = dict(rec)
+            snap["status"] = "cancelled" if cancel.is_set() else "error"
+            snap["log"] = list(rec.get("log") or []) + [f"ERROR {type(exc).__name__}: {exc}"]
+            snap.pop("cancel", None)
+            _persist_local_job(state.db_path, snap)
+            rec["log"] = snap["log"]
+            rec["status"] = snap["status"]
 
     threading.Thread(target=runner, daemon=True).start()
     return {"local": True, "local_id": local_id, "target": "local", "workspace": ws,
@@ -1023,6 +1042,106 @@ def _delete_sessions(db_path: str, session_ids: list | None, delete_all: bool) -
 
 
 # --------------------------------------------------------------------------- #
+# Local job persistence — survive backend restarts so the UI poll loop does
+# not land on "unknown local job" after Electron relaunches the API process.
+# --------------------------------------------------------------------------- #
+def _ensure_local_jobs_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_jobs (
+            local_id TEXT PRIMARY KEY,
+            target TEXT,
+            status TEXT,
+            workspace TEXT,
+            log_json TEXT,
+            outcome_json TEXT,
+            updated_at_unix REAL
+        )
+        """
+    )
+
+
+def _persist_local_job(db_path: str, rec: dict) -> None:
+    if not db_path:
+        return
+    try:
+        import json as _json
+        import time as _time
+
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        with _history_db(db_path) as conn:
+            _ensure_local_jobs_table(conn)
+            conn.execute(
+                """
+                INSERT INTO local_jobs(local_id, target, status, workspace, log_json, outcome_json, updated_at_unix)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(local_id) DO UPDATE SET
+                    status = excluded.status,
+                    workspace = excluded.workspace,
+                    log_json = excluded.log_json,
+                    outcome_json = excluded.outcome_json,
+                    updated_at_unix = excluded.updated_at_unix
+                """,
+                (
+                    rec.get("local_id"),
+                    rec.get("target", "local"),
+                    rec.get("status", "running"),
+                    rec.get("workspace", ""),
+                    _json.dumps(list(rec.get("log") or [])[-200:], default=str),
+                    _json.dumps(rec.get("outcome"), default=str) if rec.get("outcome") is not None else None,
+                    _time.time(),
+                ),
+            )
+            conn.commit()
+    except Exception:  # noqa: BLE001 - persistence must never break the job runner
+        pass
+
+
+def _load_local_jobs(db_path: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not db_path or not Path(db_path).exists():
+        return out
+    try:
+        import json as _json
+
+        with _history_db(db_path) as conn:
+            _ensure_local_jobs_table(conn)
+            rows = conn.execute(
+                "SELECT local_id, target, status, workspace, log_json, outcome_json FROM local_jobs"
+            ).fetchall()
+        for row in rows:
+            status = row["status"] or "error"
+            # In-flight jobs cannot continue after a process restart.
+            if status in {"running", "cancelling", "submitting"}:
+                status = "error"
+            log = []
+            try:
+                log = _json.loads(row["log_json"] or "[]")
+            except Exception:  # noqa: BLE001
+                log = []
+            if status == "error" and not any("interrupted by backend restart" in str(x) for x in log):
+                log = list(log) + ["interrupted by backend restart"]
+            outcome = None
+            if row["outcome_json"]:
+                try:
+                    outcome = _json.loads(row["outcome_json"])
+                except Exception:  # noqa: BLE001
+                    outcome = None
+            out[row["local_id"]] = {
+                "local_id": row["local_id"],
+                "target": row["target"] or "local",
+                "status": status,
+                "workspace": row["workspace"] or "",
+                "log": log,
+                "outcome": outcome,
+                "cancel": None,  # cannot resume a cancelled Event across restarts
+            }
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
@@ -1105,6 +1224,7 @@ def start_ollama(host: str, timeout_s: float = 25.0) -> tuple[bool, str]:
     p = urlparse(host)
     env = dict(os.environ)
     env["OLLAMA_HOST"] = f"{p.hostname or '127.0.0.1'}:{p.port or 11434}"
+    env.setdefault("OLLAMA_KEEP_ALIVE", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
     # Only point the dynamic loader at our provisioned libs when we're starting our
     # provisioned binary (a system ollama brings its own).
     lib = _provisioned_ollama_lib()
@@ -1318,7 +1438,14 @@ def make_handler(state: State):
             # data dir, streaming progress — same UX as the Ollama installer.
             self._sse_start()
             from .voice_provision import install_voice, voice_status
-            ok = install_voice(lambda m: self._safe_sse({"status": m}))
+
+            def _progress(msg):
+                if isinstance(msg, dict):
+                    self._safe_sse(msg)
+                else:
+                    self._safe_sse({"status": msg, "message": msg})
+
+            ok = install_voice(_progress)
             self._safe_sse({"done": True, "ok": ok, **voice_status()})
 
         def _stream_chat(self, body):
@@ -1347,12 +1474,36 @@ def make_handler(state: State):
                 # seeing NOTHING forever — a turn may be slow, but the stream
                 # must always be live and always end.
                 box: dict = {}
+                approval_id = uuid.uuid4().hex
+
+                def _approval_callback(call, decision):
+                    ev = threading.Event()
+                    state.pending_approvals[approval_id] = {
+                        "event": ev, "result": None,
+                        "tool": getattr(call, "name", None),
+                        "arguments": getattr(call, "arguments", {}) or {},
+                        "reason": getattr(decision, "reason", ""),
+                    }
+                    self._safe_sse({
+                        "approval_required": True,
+                        "approval_id": approval_id,
+                        "tool": getattr(call, "name", None),
+                        "arguments": getattr(call, "arguments", {}) or {},
+                        "reason": getattr(decision, "reason", ""),
+                    })
+                    # Wait up to 10 minutes for the UI to approve/deny.
+                    if not ev.wait(600):
+                        state.pending_approvals.pop(approval_id, None)
+                        return False
+                    pending = state.pending_approvals.pop(approval_id, {})
+                    return bool(pending.get("result"))
 
                 def _turn():
                     try:
                         box["res"] = stream_agent_turn(
                             app, message, body.get("session_id"),
                             emit=lambda frame: self._safe_sse(frame),
+                            approval_callback=_approval_callback,
                         )
                     except Exception as exc:  # noqa: BLE001
                         box["err"] = exc
@@ -1480,6 +1631,16 @@ def make_handler(state: State):
                     return self._json(self._chat(body))
                 if u.path == "/api/chat/stream":
                     return self._stream_chat(body)
+                if u.path == "/api/approve":
+                    aid = body.get("approval_id") or ""
+                    pending = state.pending_approvals.get(aid)
+                    if not pending:
+                        return self._json({"ok": False, "error": "unknown or expired approval"}, 404)
+                    pending["result"] = bool(body.get("approved", False))
+                    ev = pending.get("event")
+                    if ev is not None:
+                        ev.set()
+                    return self._json({"ok": True, "approved": pending["result"]})
                 if u.path == "/api/ollama/start":
                     ok, msg = start_ollama(state.ollama_host)
                     return self._json({"ok": ok, "message": msg, **setup_status(state)})
@@ -1590,6 +1751,7 @@ def make_handler(state: State):
                 cancel.set()
                 rec["status"] = "cancelling"
                 rec["log"].append("cancel requested — stopping at the next phase boundary")
+                _persist_local_job(state.db_path, rec)
                 return {"ok": True, "status": "cancelling",
                         "lines": ["cancel requested; the job stops at the next phase boundary"]}
             # Remote jobs: scancel (SLURM) / kill the runner PID (ssh).

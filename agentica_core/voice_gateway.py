@@ -158,6 +158,7 @@ class _Conn:
         self.cancel: threading.Event | None = None  # set on barge-in to stop the agent loop
         self.audio = bytearray()
         self.audio_sr = 16000
+        self._approval_box: dict[str, Any] | None = None
         # Same shared-secret gate as the HTTP API: when AGENTICA_API_TOKEN is set
         # the client's `start` message must carry it, else any local process /
         # web page could open ws://127.0.0.1:8771 and drive the agent.
@@ -241,6 +242,11 @@ class _Conn:
                 await self._spawn_turn(phrase)
         elif t == "barge_in":
             await self._interrupt()  # supersede emits/speaking AND stop the agent loop
+        elif t in {"approve", "deny"}:
+            box = self._approval_box
+            if box and box.get("event") is not None:
+                box["result"] = t == "approve"
+                box["event"].set()
 
     def _app(self):
         return self.state.app_for(self.workspace, target=self.target, model=self.model,
@@ -318,9 +324,32 @@ class _Conn:
             await self._send({"type": "status", "text": "working on it…"})
 
             last_summary: list[str | None] = [None]
+            spoken_final = threading.Event()
+            approval_box: dict[str, Any] = {"event": None, "result": None}
 
             def emit(frame):
                 if self.turn_id != my:
+                    return
+                if "final_answer" in frame:
+                    # Start TTS as soon as the engine logs final_answer — don't
+                    # wait for stream_agent_turn's worker thread to join.
+                    answer = _clean_answer(frame.get("final_answer") or "", last_summary[0])
+                    if answer and not spoken_final.is_set():
+                        spoken_final.set()
+                        asyncio.run_coroutine_threadsafe(
+                            self._send({"type": "answer", "text": answer}), self.loop)
+                        threading.Thread(
+                            target=self._speak_blocking,
+                            args=(answer, my),
+                            daemon=True,
+                            name="agentica-early-tts",
+                        ).start()
+                    return
+                if "approval" in frame:
+                    asyncio.run_coroutine_threadsafe(self._send({
+                        "type": "approval_required",
+                        **(frame.get("approval") or {}),
+                    }), self.loop)
                     return
                 if "step" in frame:
                     obs = (frame["step"] or {}).get("observation")
@@ -333,13 +362,35 @@ class _Conn:
                     return
                 asyncio.run_coroutine_threadsafe(self._send(out), self.loop)
 
+            def approval_callback(call, decision):
+                # Pause the agent loop until the client sends approve/deny.
+                approval_box["event"] = threading.Event()
+                approval_box["result"] = None
+                asyncio.run_coroutine_threadsafe(self._send({
+                    "type": "approval_required",
+                    "tool": getattr(call, "name", None),
+                    "arguments": getattr(call, "arguments", {}) or {},
+                    "reason": getattr(decision, "reason", ""),
+                    "blocking": True,
+                }), self.loop)
+                ev = approval_box["event"]
+                while not ev.wait(0.25):
+                    if self.turn_id != my or cancel.is_set():
+                        return False
+                return bool(approval_box.get("result"))
+
             # Steer the model toward a short, conversational spoken reply — details,
             # lists, and tables belong on the canvas, not read aloud.
             agent_text = text + _VOICE_STEER
+            self._approval_box = approval_box
 
             def work():
                 return stream_agent_turn(
-                    app, agent_text, self.session_id, emit, cancel_event=cancel)
+                    app, agent_text, self.session_id, emit,
+                    cancel_event=cancel,
+                    max_steps=4,
+                    approval_callback=approval_callback,
+                )
 
             # Per-turn wall-clock deadline so a wedged model/tool can't leave the
             # conversation stuck in "thinking" forever. On timeout, tell the agent
@@ -351,8 +402,12 @@ class _Conn:
             self.session_id = res.get("session_id", self.session_id)
             # Never speak loop bookkeeping — prefer the last tool's human summary.
             answer = _clean_answer(res.get("final_answer") or "", last_summary[0])
-            await self._send({"type": "answer", "text": answer})
-            await self._speak(answer, my)
+            if not spoken_final.is_set():
+                await self._send({"type": "answer", "text": answer})
+                await self._speak(answer, my)
+            else:
+                # Early TTS already started; still ensure the text answer is on screen.
+                await self._send({"type": "answer", "text": answer})
         except asyncio.TimeoutError:
             cancel.set()
             if self.turn_id == my:
@@ -386,6 +441,23 @@ class _Conn:
                 "pcm": base64.b64encode(pcm).decode("ascii"),
                 "sr": sr,
             }), self.loop)
+
+    def _speak_blocking(self, text: str, my: int):
+        """Full-answer TTS from a worker thread (early final_answer path)."""
+        text = _spoken_text(text)
+        if not text:
+            return
+        try:
+            from .voice_provision import synthesize_pcm, voice_status
+
+            if not voice_status().get("tts_ready"):
+                return
+            for sentence in _split_sentences(text):
+                if self.turn_id != my:
+                    return
+                self._synth_send_blocking(sentence, my)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _speak(self, text: str, my: int):
         text = _spoken_text(text)

@@ -199,7 +199,7 @@ def test_gateway_turn_is_always_agentic_and_propagates_runtime(monkeypatch):
     monkeypatch.delenv("AGENTICA_API_TOKEN", raising=False)
     calls = []
 
-    def agent_turn(app, message, session_id, emit, cancel_event=None):
+    def agent_turn(app, message, session_id, emit, cancel_event=None, **_kwargs):
         calls.append((app, message, session_id, cancel_event))
         return {"final_answer": "agent answer", "steps": [], "session_id": "s2"}
 
@@ -289,7 +289,7 @@ def test_agent_timeout_and_barge_in_each_terminate(monkeypatch):
 
     monkeypatch.delenv("AGENTICA_API_TOKEN", raising=False)
 
-    def waits_for_cancel(_app, _message, _session_id, _emit, cancel_event=None):
+    def waits_for_cancel(_app, _message, _session_id, _emit, cancel_event=None, **_kwargs):
         cancel_event.wait(1)
         return {"final_answer": "(interrupted)", "steps": []}
 
@@ -312,7 +312,7 @@ def test_agent_timeout_and_barge_in_each_terminate(monkeypatch):
     monkeypatch.setattr(vg, "_TURN_TIMEOUT_S", 10)
     started = threading.Event()
 
-    def cancellable(_app, _message, _session_id, _emit, cancel_event=None):
+    def cancellable(_app, _message, _session_id, _emit, cancel_event=None, **_kwargs):
         started.set()
         cancel_event.wait(1)
         return {"final_answer": "(interrupted)", "steps": []}
@@ -376,7 +376,27 @@ def test_local_tts_ignores_remote_url_and_falls_back_to_piper(monkeypatch):
     assert not hasattr(vp, "synthesize_remote_pcm")
 
 
-def test_warmup_never_downloads_missing_stt_weights(monkeypatch):
+def test_warmup_downloads_missing_stt_weights(monkeypatch):
+    import agentica_core.voice_provision as vp
+
+    calls = []
+    ready = {"ok": False}
+    monkeypatch.setattr(vp, "stt_engine", lambda: "mlx")
+    monkeypatch.setattr(vp, "_stt_model_ready", lambda _engine=None: ready["ok"])
+    monkeypatch.setattr(
+        vp, "install_voice",
+        lambda _progress: calls.append("install") or ready.update(ok=True) or True,
+    )
+    monkeypatch.setattr(vp, "transcribe_pcm16", lambda *_args: "")
+    monkeypatch.setattr(vp, "_load_kokoro", lambda: object())
+    out = vp.warmup()
+    assert calls == ["install"]
+    assert out["downloaded"] is True
+    assert out["stt"] is True
+    assert out["tts"] is True
+
+
+def test_warmup_can_skip_download(monkeypatch):
     import agentica_core.voice_provision as vp
 
     monkeypatch.setattr(vp, "stt_engine", lambda: "mlx")
@@ -386,7 +406,7 @@ def test_warmup_never_downloads_missing_stt_weights(monkeypatch):
         lambda *_args: (_ for _ in ()).throw(AssertionError("must not download")),
     )
     monkeypatch.setattr(vp, "_load_kokoro", lambda: object())
-    assert vp.warmup() == {"stt": False, "tts": True}
+    assert vp.warmup(download_missing=False) == {"stt": False, "tts": True, "downloaded": False}
 
 
 def test_install_voice_fetches_stt_weights(monkeypatch, tmp_path):
