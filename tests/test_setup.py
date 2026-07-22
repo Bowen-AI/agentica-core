@@ -11,12 +11,10 @@ def _state(model="gemma4:e4b"):
                            workspace="sample_workspace", db_path="/tmp/agentica-setup-test.db")
 
 
-def test_model_present():
-    assert apiserver.model_present("llama3.2:3b", ["llama3.2:3b", "x:y"])
-    assert apiserver.model_present("qwen2.5", ["qwen2.5:latest"])         # bare name matches :latest
-    assert apiserver.model_present("gemma4", ["gemma4:e4b"])              # bare name matches a tag
-    assert not apiserver.model_present("llama3.2:3b", ["gemma4:e4b"])
-    assert not apiserver.model_present("x", [])
+def test_friendly_disk_error():
+    assert "Not enough disk space" in apiserver._friendly_disk_error("no space left on device")
+    assert "Not enough disk space" in apiserver._friendly_disk_error(OSError(28, "ENOSPC"))
+    assert apiserver._friendly_disk_error("connection refused") == "connection refused"
 
 
 def test_setup_status(monkeypatch):

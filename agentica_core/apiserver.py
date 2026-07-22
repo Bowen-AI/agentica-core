@@ -1193,6 +1193,16 @@ def model_present(model: str, models: list[str]) -> bool:
             or (":" not in model and any(m.split(":")[0] == model for m in models)))
 
 
+def _friendly_disk_error(exc: object) -> str:
+    """Rewrite ENOSPC / 'no space' into copy the Setup UI can show plainly."""
+    msg = str(exc)
+    low = msg.lower()
+    if "enospc" in low or "no space left" in low or "not enough space" in low:
+        return ("Not enough disk space to download the model. "
+                "Free ~5 GB under your Ollama models directory and retry.")
+    return msg
+
+
 def setup_status(state: "State") -> dict:
     # A status check must NEVER 500 -- degrade to "not ready" on any unexpected error.
     try:
@@ -1388,6 +1398,8 @@ def make_handler(state: State):
                         evt = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if evt.get("error"):
+                        evt = {**evt, "error": _friendly_disk_error(evt["error"])}
                     self._sse(evt)
                     if evt.get("status") == "success" or evt.get("error"):
                         break
@@ -1424,7 +1436,7 @@ def make_handler(state: State):
                 _remote_models_cache.pop(t, None)
                 self._sse({"done": True})
             except Exception as exc:  # noqa: BLE001
-                self._safe_sse({"error": str(exc), "done": True})
+                self._safe_sse({"error": _friendly_disk_error(exc), "done": True})
 
         def _stream_install(self):
             self._sse_start()
