@@ -97,7 +97,8 @@ def test_install_returns_true_when_already_installed(monkeypatch):
     assert any("already" in m.lower() for m in msgs)
 
 
-def test_install_is_graceful_without_zstd(monkeypatch):
+def test_install_is_graceful_without_zstd(monkeypatch, tmp_path):
+    monkeypatch.setattr(apiserver, "OLLAMA_HOME", tmp_path)
     # ollama missing, download works, but no decompressor available -> graceful False, no raise.
     monkeypatch.setattr(apiserver, "_IS_MAC", False)  # exercise the Linux (.tar.zst) path
     monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: None)
@@ -109,7 +110,8 @@ def test_install_is_graceful_without_zstd(monkeypatch):
     assert any("ERROR" in m and "zstd" in m for m in msgs)
 
 
-def test_install_is_graceful_on_download_failure(monkeypatch):
+def test_install_is_graceful_on_download_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(apiserver, "OLLAMA_HOME", tmp_path)
     monkeypatch.setattr(apiserver, "find_ollama_bin", lambda: None)
 
     def boom(*a, **k):

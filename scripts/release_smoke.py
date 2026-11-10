@@ -49,10 +49,7 @@ def _smoke_voice_roundtrip() -> None:
         return
     result = selftest()
     if not result.get("ok"):
-        # Soft-fail: models present but runtime missing (e.g. no Metal in CI).
-        print("release smoke SKIP: voice selftest not ok — "
-              f"errors={result.get('errors')}")
-        return
+        raise RuntimeError(f"Voice selftest failed: {result.get('errors')}")
     print("release smoke OK: voice STT↔TTS round-trip "
           f"(engine={result.get('tts_engine')}, text={result.get('roundtrip_text')!r})")
 
@@ -119,8 +116,7 @@ def main() -> int:
     _smoke_agent_stream()
     _smoke_voice_roundtrip()
     _smoke_local_job_cycle()
-    print("NOTE: re-cut Electron release binaries from the voice-mode branch after "
-          "these smokes pass (installed v0.2.3 predates several of these fixes).")
+
     return 0
 
 

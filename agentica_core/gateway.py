@@ -43,17 +43,10 @@ def make_gateway_handler(
     app: AgentServerApp,
     *,
     auth_token: str | None,
-    remote_v1_base: str,
-    v1_mode: str,
     model_label: str,
     public_api_base: str,
 ):
-    """Build the agentic gateway handler.
-
-    ``remote_v1_base`` and ``v1_mode`` remain accepted for callers from older
-    releases.  They no longer select a plain proxy: even the legacy
-    ``v1_mode='passthrough'`` value is an agentic compatibility alias.
-    """
+    """Build the gateway; every conversational request runs the agent loop."""
 
     class GatewayHandler(BaseHTTPRequestHandler):
         server_version = f"agentica-core/{__version__}"
@@ -447,7 +440,7 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
               auth_token: str | None, system_prompt: str | None = None,
               provider: str = "ollama", api_base: str | None = None,
               api_key: str | None = None, tools_target: str | None = None,
-              target: str | None = None) -> AgentServerApp:
+              target: str | None = None, local_gguf: bool = False) -> AgentServerApp:
     """Construct an app with model hosting and tool execution independently selectable.
 
     ``tools_target`` controls only file/shell placement. ``target`` remains a
@@ -479,23 +472,11 @@ def build_app(*, ollama_host: str, model_name: str, workspace: str, db_path: str
             registry = create_local_tools(enable_network=True)
         return register_voice_tools(registry)
 
-    # Pass tools_factory + system_prompt, degrading on an older engine that
-    # lacks either kwarg (a release that pip-installs an older AgenticLocal).
-    # IMPORTANT: keep a tools_factory-ONLY rung before the bare {} so that an
-    # engine which has tools_factory but not system_prompt (e.g. AgenticLocal
-    # main) still gets the canvas tools (get_weather, ...) instead of silently
-    # falling all the way through to {} and losing them.
-    for extra in (
-        {"tools_factory": _tools_factory, "system_prompt": system_prompt},
-        {"tools_factory": _tools_factory},
-        {"system_prompt": system_prompt},
-        {},
-    ):
-        try:
-            return AgentServerApp(**kwargs, **extra)
-        except TypeError:
-            continue
-    return AgentServerApp(**kwargs)
+    app_type = AgentServerApp
+    if local_gguf:
+        from .llama_model import LlamaAgentServerApp
+        app_type = LlamaAgentServerApp
+    return app_type(**kwargs, tools_factory=_tools_factory, system_prompt=system_prompt)
 
 
 def run_gateway_server(handler_cls, host: str, port: int) -> ThreadingHTTPServer:
@@ -513,7 +494,6 @@ def up(
     model_override: str | None = None,
     workspace: str = "sample_workspace",
     db_path: str = ".agentic/agentic.db",
-    v1_mode: str = "agentic",
     skip_preflight: bool = False,
     serve_wait_s: float = 600.0,
     _print=print,
@@ -542,9 +522,8 @@ def up(
 
     if ollama_host:
         # Slice 0 / manual mode: no SLURM, no tunnel.
-        remote_v1_base = ollama_host.rstrip("/") + "/v1"
-        return _serve_local(cluster, ollama_host, remote_v1_base, model_name,
-                            workspace, db_path, token, v1_mode, _print)
+        return _serve_local(cluster, ollama_host, model_name,
+                            workspace, db_path, token, _print)
 
     # Full path: bring up the model on the cluster, then tunnel.
     transport = Transport.from_cluster(cluster)
@@ -560,11 +539,10 @@ def up(
         with transport.tunnel(tunnel_port, handle.node, handle.port,
                               readiness_url=readiness, readiness_timeout_s=serve_wait_s) as tun:
             local_ollama = tun.base_url
-            remote_v1_base = local_ollama + "/v1"
             _print(f"[tunnel] ready at {local_ollama}")
             try:
-                _serve_local(cluster, local_ollama, remote_v1_base, model_name,
-                             workspace, db_path, token, v1_mode, _print,
+                _serve_local(cluster, local_ollama, model_name,
+                             workspace, db_path, token, _print,
                              on_exit_note=f"SLURM job {handle.job_id} left RUNNING "
                                           f"(cancel with: slurm-agentic down {cluster_path} --job {handle.job_id})")
             except KeyboardInterrupt:
@@ -575,15 +553,15 @@ def up(
     return 0
 
 
-def _serve_local(cluster, ollama_host, remote_v1_base, model_name, workspace, db_path,
-                 token, v1_mode, _print, on_exit_note: str | None = None) -> int:
+def _serve_local(cluster, ollama_host, model_name, workspace, db_path,
+                 token, _print, on_exit_note: str | None = None) -> int:
     app = build_app(ollama_host=ollama_host, model_name=model_name,
                     workspace=workspace, db_path=db_path, auth_token=token)
     host = cluster.gateway.bind_host
     port = cluster.gateway.port
     public_api_base = f"http://{host}:{port}/v1"
     handler = make_gateway_handler(
-        app, auth_token=token, remote_v1_base=remote_v1_base, v1_mode=v1_mode,
+        app, auth_token=token,
         model_label=model_name, public_api_base=public_api_base,
     )
     server = run_gateway_server(handler, host, port)

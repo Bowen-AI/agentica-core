@@ -20,17 +20,23 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Install agentic-loop (AgenticLocal) engine
-        run: pip install "git+https://github.com/Bowen-AI/AgenticLocal.git"
-
       - name: Install agentica-core + test deps
         run: pip install -e . pytest
 
-      - name: Unit + offline e2e tests
-        run: python -m pytest tests/ -q
+      - name: Install isolated SSH test prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+
+      - name: Full suite including real localhost SSH
+        run: python scripts/test_with_sshd.py
 
       - name: GPU-vs-model library is self-consistent
         run: python -c "from agentica_core import catalog; bad=catalog.validate_library(); assert not bad, bad; print(len(catalog.PRESETS), 'presets OK')"
+
+      - name: Runtime smoke
+        run: python -m agentica_core.cli doctor
 
       - name: CLI smoke
         run: |

@@ -157,7 +157,7 @@ it runs as a recorded remote process group. For a SLURM target, it submits with
 ```sh
 agentica hosts
 agentica discover discovery.usc.edu
-agentica up examples/cluster.yaml --v1-mode agentic
+agentica up examples/cluster.yaml
 agentica fit qwen3-235b-a22b a100-80 --count 2 --quant int4
 agentica library --gpu l40s
 ```
@@ -261,3 +261,41 @@ Every **locally-runnable** model run through the **10 example agentic-job tasks*
 
 _Regenerate: `python scripts/bench.py --repeats 5`._
 <!-- BENCH:END -->
+
+## Local llama.cpp / GGUF
+
+The desktop API accepts `engine: "llamacpp"` with an absolute local GGUF model
+path (or `~/...`). Agent, Voice, and local Jobs use the full agent loop. Install
+`llama-server` separately (`brew install llama.cpp` on macOS), or set
+`AGENTICA_LLAMA_SERVER` to a standalone binary. There is no remote llama.cpp job
+path; Ollama and vLLM continue to support their existing remote workflows.
+
+The backend owns one loopback-only llama.cpp process. Requests lease it for the
+whole agent turn/job; a model switch waits for active work before replacing the
+resident GGUF. The server uses Jinja tool parsing, one slot, Metal offload when
+available, and an 8,192-token context (`AGENTICA_LLAMA_CONTEXT` overrides it).
+`llama-server.log` is written beside the database. Quit/restart the backend to
+release the model. Use a recent llama.cpp and a compatible tool-capable GGUF.
+
+Agentica adapts the pinned engine's history into one leading system message and
+native tool-call/result pairs for GGUF templates. Approval callbacks and workspace
+policy remain active. The gateway no longer accepts the obsolete `--v1-mode`
+selector; all chat and OpenAI-compatible gateway turns are agentic.
+
+```sh
+agentica-core doctor                  # dependency/tool compatibility, no model downloads
+agentica-core doctor --require-voice  # additionally checks speech runtime imports
+python -m pytest tests -q
+python scripts/release_smoke.py
+# Opt-in real inference in a disposable workspace:
+python scripts/inference_smoke.py --engine llamacpp --model /absolute/model.gguf
+```
+
+The real inference smoke requires the model to read an unpredictable value from a
+file and write it to another file. Tiny models may fail this behavioral check even
+when runtime integration works; Qwen3.5 4B Q4_K_M passed on Apple Silicon during
+this change. This is a functional check, not a performance benchmark.
+
+To include the optional real SSH case without configuring your account, run
+`python scripts/test_with_sshd.py`. It generates disposable keys, starts sshd on
+a random loopback port, and runs the entire suite without touching `~/.ssh`.

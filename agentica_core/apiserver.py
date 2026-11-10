@@ -26,6 +26,9 @@ Jobs go local (background thread) or remote (job.submit over ssh/SLURM).
 from __future__ import annotations
 
 import datetime
+from contextlib import nullcontext
+import signal
+import platform
 import json
 import os
 import shutil
@@ -44,6 +47,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__, catalog, gateway, job, serving, sshconfig
 from .voice_stream import stream_agent_turn
+from .llamacpp import LlamaServer, LeasedAgentApp
 from .voice_gateway import start_voice_gateway
 from .config import (DEFAULT_OLLAMA_PORT, DEFAULT_VLLM_PORT, ClusterConfig, ModelConfig,
                      PlanConfig, SuccessCriteria)
@@ -157,6 +161,7 @@ class State:
         self.model = model
         self.workspace = workspace
         self.db_path = db_path
+        self.llama = LlamaServer(Path(db_path).resolve().parent)
         self._apps: dict[tuple, object] = {}        # runtime/workspace -> AgentServerApp
         self._runtimes: dict[tuple[str, str, str], RuntimeBinding] = {}
         self._runtime_lock = threading.Lock()
@@ -215,8 +220,10 @@ class State:
         return self.model
 
     def _engine_for(self, target: str, model: str, engine: str | None) -> str:
-        if engine in {"ollama", "vllm"}:
+        if engine in {"ollama", "vllm", "llamacpp"}:
             return engine
+        if engine:
+            raise ValueError(f"Unknown model engine: {engine}")
         cluster = self.target_cluster(target)
         if cluster and model == cluster.model.name:
             return cluster.model.engine
@@ -228,10 +235,15 @@ class State:
         selected_model = model or self.default_model_for_target(t)
         selected_engine = self._engine_for(t, selected_model, engine)
         if t == "local":
+            if selected_engine == "llamacpp":
+                with self.llama.use(selected_model, notify) as base_url:
+                    return RuntimeBinding(t, selected_model, selected_engine, base_url)
             if selected_engine != "ollama":
-                raise RuntimeError("local chat currently supports Ollama models only")
+                raise RuntimeError("Local inference supports Ollama or llama.cpp; vLLM needs a remote machine.")
             return RuntimeBinding(t, self.resolve_model(selected_model), "ollama", self.ollama_host)
 
+        if selected_engine == "llamacpp":
+            raise ValueError("llama.cpp currently supports local GGUF files only; select the local model machine.")
         key = (t, selected_model, selected_engine)
         with self._runtime_lock:
             cached = self._runtimes.get(key)
@@ -281,6 +293,12 @@ class State:
         # With no explicit remote path, operate from that host's current/home dir.
         ws = workspace or (self.workspace if tools_target == "local" else ".")
         rt = self.runtime_for(target, model, engine, notify=notify)
+        if rt.engine == "llamacpp":
+            factory = lambda base_url: self._app_for_runtime(ws, tools_target, replace(rt, base_url=base_url))
+            return LeasedAgentApp(factory(rt.base_url), self.llama, rt.model, factory)
+        return self._app_for_runtime(ws, tools_target, rt)
+
+    def _app_for_runtime(self, ws, tools_target, rt):
         # Key by date too, so a long-running backend rebuilds with a fresh "today" in
         # the system preamble (the AgentServerApp caches its controller/system prompt).
         key = (ws, tools_target, datetime.date.today().isoformat(),
@@ -291,6 +309,7 @@ class State:
                 ollama_host=rt.base_url, model_name=rt.model,
                 workspace=ws, db_path=self.db_path, auth_token=None,
                 provider=provider, api_base=rt.api_base,
+                **({"local_gguf": True} if rt.engine == "llamacpp" else {}),
                 system_prompt=AGENTICA_SYSTEM_PROMPT + "\n\n" + _runtime_preamble(
                     ws, target=rt.target, model=rt.model, engine=rt.engine,
                     workspace_target=tools_target,
@@ -314,10 +333,12 @@ class State:
         (so plan parsing can't fail on malformed model output)."""
         rt = self.runtime_for(target, model, engine, notify=on_status)
         if rt.engine != "ollama":
-            return self._complete_stream_openai(
-                rt, messages, on_content=on_content, fmt=fmt,
-                temperature=temperature, timeout=timeout,
-            )
+            lease = self.llama.use(rt.model) if rt.engine == "llamacpp" else nullcontext(rt.base_url)
+            with lease as base_url:
+                return self._complete_stream_openai(
+                    replace(rt, base_url=base_url), messages, on_content=on_content, fmt=fmt,
+                    temperature=temperature, timeout=timeout,
+                )
         url = rt.base_url + "/api/chat"
         payload: dict = {"model": rt.model, "messages": messages,
                          "think": think, "stream": True, "options": {"temperature": temperature}}
@@ -836,7 +857,7 @@ def _derive_protect(test_cmd: str | None, ws: str) -> list[str]:
 
 def submit_local(state: State, plan: dict, workspace: str, model: str | None = None,
                  engine: str | None = None) -> dict:
-    """Run the agentic job in a background thread against local ollama."""
+    """Run a local agentic job with the selected inference engine."""
     local_id = "local-" + uuid.uuid4().hex[:8]
     ws = workspace or tempfile.mkdtemp(prefix="agentica-job-")
     Path(ws).mkdir(parents=True, exist_ok=True)
@@ -867,17 +888,18 @@ def submit_local(state: State, plan: dict, workspace: str, model: str | None = N
             rec["log"].append(msg)
             _persist_local_job(state.db_path, rec)
         try:
-            selected_model = model or state.resolve_model()
-            selected_engine = engine or ("vllm" if "/" in selected_model else "ollama")
-            if selected_engine != "ollama":
-                raise RuntimeError(
-                    "local jobs currently support Ollama models only "
-                    "(pick an Ollama tag in the sidebar, or submit to a remote worker)"
-                )
-            outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
-                              provider="ollama", model_name=selected_model,
-                              ollama_host=state.ollama_host, model_timeout=300, _print=note,
-                              cancel_event=cancel)
+            rt = state.runtime_for("local", model, engine, notify=note)
+            lease = state.llama.use(rt.model) if rt.engine == "llamacpp" else nullcontext(rt.base_url)
+            with lease as base_url:
+                model_adapter = {}
+                if rt.engine == "llamacpp":
+                    from .llama_model import LlamaChatModel
+                    model_adapter["model"] = LlamaChatModel(rt.model, base_url + "/v1")
+                outcome = run_job(pc, workspace=ws, db_path=str(Path(ws) / "job.db"),
+                                  provider="ollama" if rt.engine == "ollama" else "openai-compatible",
+                                  model_name=rt.model, ollama_host=base_url,
+                                  api_base=base_url.rstrip("/") + "/v1", model_timeout=300,
+                                  _print=note, cancel_event=cancel, **model_adapter)
             # Persist BEFORE flipping in-memory status so waiters that observe a
             # terminal status always find it already written to SQLite.
             snap = dict(rec)
@@ -915,6 +937,8 @@ def submit_remote(plan: dict, target: str, cluster_path: str, workspace: str,
     snapshot of the local ``workspace`` directory into the per-job dir (results can
     be rsynced back afterwards -- ``sync_to`` in the response); "remote" runs
     against ``workspace`` as an existing path on the target machine."""
+    if engine == "llamacpp":
+        raise ValueError("llama.cpp jobs require the local worker and a local GGUF path.")
     source = workspace_source or "local"
     cluster = ClusterConfig.resolve(cluster_path)
     selected_model = model or cluster.model.name
@@ -1828,7 +1852,7 @@ def make_handler(state: State):
 
 def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = None,
           db_path: str | None = None, ollama_host: str = "http://127.0.0.1:11434",
-          model: str = "qwen3.5:4b-mlx", clusters_dir: str | None = None) -> int:
+          model: str | None = None, clusters_dir: str | None = None) -> int:
     # The desktop app launches us with CWD=/ (read-only), so resolve data paths to a
     # WRITABLE absolute dir (the app passes AGENTICA_DATA_DIR; fall back to ~/.local).
     # Relative defaults like ".agentic" would otherwise fail with EROFS on every chat.
@@ -1840,6 +1864,9 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     except OSError as exc:  # noqa: BLE001
         print(f"warning: could not create data dir {data_dir}: {exc}")
+    model = model or os.environ.get("AGENTICA_MODEL") or (
+        "qwen3.5:4b-mlx" if platform.system() == "Darwin" and platform.machine() == "arm64" else "qwen3.5:4b"
+    )
     state = State(ollama_host=ollama_host, model=model, workspace=workspace, db_path=db_path,
                   clusters_dir=clusters_dir)
     # Per-launch shared secret (the desktop app mints it and passes it to BOTH
@@ -1863,10 +1890,16 @@ def serve(*, host: str = "127.0.0.1", port: int = 8770, workspace: str | None = 
     if state.clusters:
         print(f"  cluster targets: {sorted(state.clusters)}")
     print(f"  Agentica UI dev server should call this base URL.")
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    def stop_on_signal(*_args):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop_on_signal)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
         server.server_close()
+        state.llama.close()
+        signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
