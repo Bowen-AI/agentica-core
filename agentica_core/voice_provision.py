@@ -355,9 +355,7 @@ def warmup(*, download_missing: bool = True) -> dict:
     selected = stt_engine()
     if selected and _stt_model_ready(selected):
         try:
-            import numpy as np
-
-            silence = np.zeros(1600, dtype=np.int16).tobytes()  # 0.1s @16k
+            silence = bytes(1600 * 2)  # 0.1s of signed 16-bit PCM @16k
             transcribe_pcm16(silence, 16000)
             out["stt"] = True
         except Exception:  # noqa: BLE001

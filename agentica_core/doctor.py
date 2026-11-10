@@ -1,5 +1,6 @@
 """Offline release/runtime validation; never downloads model weights."""
 import importlib
+import importlib.util
 import inspect
 import platform
 import tempfile
@@ -14,7 +15,14 @@ def check(*, require_voice=False):
     if require_voice:
         modules += ["faster_whisper", "kokoro_onnx", "soundfile"]
         if platform.system() == "Darwin" and platform.machine() == "arm64":
-            modules += ["mlx_whisper"]
+            # MLX's native initializer can abort without a Metal device. Hosted
+            # macOS builders must still validate the bundled package and use the
+            # required CPU fallback; only import MLX when Metal is available.
+            from .voice_provision import _metal_available
+            if importlib.util.find_spec("mlx_whisper") is None:
+                errors.append("mlx_whisper: package is missing")
+            elif _metal_available():
+                modules += ["mlx_whisper"]
     for module in modules:
         try:
             importlib.import_module(module)
