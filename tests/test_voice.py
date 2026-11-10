@@ -411,6 +411,20 @@ def test_warmup_can_skip_download(monkeypatch):
     assert vp.warmup(download_missing=False) == {"stt": False, "tts": True, "downloaded": False}
 
 
+def test_gateway_startup_does_not_download_unused_voice_models(monkeypatch):
+    from agentica_core import voice_gateway, voice_provision as vp
+
+    downloads, loads = [], []
+    monkeypatch.setattr(vp, "stt_engine", lambda: None)
+    monkeypatch.setattr(vp, "_kokoro_ready", lambda: False)
+    monkeypatch.setattr(vp, "_piper_binary", lambda: None)
+    monkeypatch.setattr(vp, "install_voice", lambda *_: downloads.append(True))
+    monkeypatch.setattr(vp, "_load_kokoro", lambda: loads.append(True))
+    voice_gateway._warm_models()
+    assert loads == [True]
+    assert downloads == []
+
+
 def test_install_voice_fetches_stt_weights(monkeypatch, tmp_path):
     import agentica_core.voice_provision as vp
 

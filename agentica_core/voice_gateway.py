@@ -124,7 +124,9 @@ def _warm_models():
     try:
         from .voice_provision import warmup
 
-        warmup()
+        # Starting the desktop must not download unused speech weights. Setup
+        # and Voice expose explicit provisioning controls; warm only what exists.
+        warmup(download_missing=False)
     except Exception:  # noqa: BLE001 - models not installed yet; first turn reports it
         pass
 
