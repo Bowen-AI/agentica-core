@@ -60,6 +60,8 @@ def test_sbatch_no_jobid_raises(tmp_path):
 
 
 def _ssh_localhost_works() -> bool:
+    if os.environ.get("AGENTICA_TEST_SSH_PORT"):
+        return True  # explicit integration configuration must pass, never skip
     try:
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost", "true"],
@@ -71,8 +73,18 @@ def _ssh_localhost_works() -> bool:
 
 
 @pytest.mark.skipif(not _ssh_localhost_works(), reason="passwordless ssh localhost not available")
-def test_ssh_localhost_exec():
+def test_ssh_localhost_exec(monkeypatch):
     t = Transport.ssh_localhost()
+    if os.environ.get("AGENTICA_TEST_SSH_PORT"):
+        from agentica_core import transport
+        # Keep the test's host key and connection socket out of the user's ~/.ssh.
+        monkeypatch.setattr(transport, "SSH_BASE_OPTS", [
+            "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=5", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+        ])
+        t.target.port = int(os.environ["AGENTICA_TEST_SSH_PORT"])
+        t.target.key_path = os.environ["AGENTICA_TEST_SSH_KEY"]
+        t.target.options = ["UserKnownHostsFile=" + os.environ["AGENTICA_TEST_SSH_KNOWN_HOSTS"]]
     res = t.exec("echo via-ssh")
     assert res.ok and res.out.strip() == "via-ssh"
 

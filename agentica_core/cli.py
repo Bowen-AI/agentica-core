@@ -22,6 +22,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="agentica")
     sub = parser.add_subparsers(dest="command")
 
+    p_doctor = sub.add_parser("doctor", help="Check bundled dependencies without downloading models.")
+    p_doctor.add_argument("--require-voice", action="store_true")
+
     p_api = sub.add_parser("serve-api", help="Start the JSON API for the Agentica UI.")
     p_api.add_argument("--host", default="127.0.0.1")
     p_api.add_argument("--port", type=int, default=8770)
@@ -29,7 +32,7 @@ def main(argv=None) -> int:
     p_api.add_argument("--workspace", default=None)
     p_api.add_argument("--db", default=None)
     p_api.add_argument("--ollama-host", default="http://127.0.0.1:11434")
-    p_api.add_argument("--model", default="qwen3.5:4b-mlx")
+    p_api.add_argument("--model", default=None)
     p_api.add_argument("--clusters-dir", default=None,
                        help="Folder of cluster.yaml files exposed as job targets (SLURM "
                             "account/partition/setup). Default: $AGENTICA_CLUSTERS_DIR or "
@@ -50,11 +53,6 @@ def main(argv=None) -> int:
     p_up.add_argument("--model", default=None, help="Override the served model tag (else cluster.yaml model.name).")
     p_up.add_argument("--workspace", default="sample_workspace")
     p_up.add_argument("--db", default=".agentic/agentic.db")
-    p_up.add_argument(
-        "--v1-mode", choices=["agentic", "passthrough"], default="agentic",
-        help=("OpenAI-compatible API mode. 'passthrough' is retained as a deprecated "
-              "alias; all requests still run the agent loop."),
-    )
     p_up.add_argument("--skip-preflight", action="store_true")
 
     p_down = sub.add_parser("down", help="Cancel a running serve job.")
@@ -105,6 +103,12 @@ def main(argv=None) -> int:
         parser.print_help()
         return 1
 
+    if args.command == "doctor":
+        import json
+        from .doctor import check
+        report = check(require_voice=args.require_voice)
+        print(json.dumps(report, indent=2))
+        return 0 if report["ok"] else 2
     if args.command == "serve-api":
         from . import apiserver
         return apiserver.serve(host=args.host, port=args.port, workspace=args.workspace,
@@ -144,7 +148,7 @@ def main(argv=None) -> int:
     if args.command == "up":
         from . import gateway
         return gateway.up(args.cluster, ollama_host=args.ollama_host, model_override=args.model,
-                          workspace=args.workspace, db_path=args.db, v1_mode=args.v1_mode,
+                          workspace=args.workspace, db_path=args.db,
                           skip_preflight=args.skip_preflight)
     if args.command == "down":
         from . import gateway

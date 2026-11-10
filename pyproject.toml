@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentica-core"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first runtime for agentic chat, voice, and parallel local, SSH, or SLURM jobs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,11 +14,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# agentic-loop is unpublished -> install it editable from the sibling checkout:
-#   pip install -e ../AgenticLocal
-# agentica_core also falls back to adding ../AgenticLocal to sys.path at import
-# time so the dev layout works without an explicit install.
+# Keep the tool/approval runtime identical in source installs and desktop releases.
 dependencies = [
+  "agentic-loop @ git+https://github.com/Bowen-AI/AgenticLocal.git@f5d4794dc4582e8f71ccf5d6711e9354940fa51e",
   "PyYAML>=6",
   "websockets>=12",  # voice gateway (full-duplex WS for the local voice engine)
 ]
@@ -39,6 +37,7 @@ voice = [
 
 [project.scripts]
 agentica = "agentica_core.cli:main"
+agentica-core = "agentica_core.cli:main"
 slurm-agentic = "agentica_core.cli:main"  # back-compat alias
 
 [tool.setuptools.packages.find]

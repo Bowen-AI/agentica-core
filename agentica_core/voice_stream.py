@@ -172,16 +172,8 @@ def _chat(
         kwargs["max_steps"] = max_steps
     if approval_callback is not None and _chat_supports(app, "approval_callback"):
         kwargs["approval_callback"] = approval_callback
-    try:
-        return app.chat(message, session_id, **kwargs)
-    except TypeError:
-        # Older engines that reject unexpected kwargs.
-        if cancel_event is not None:
-            try:
-                return app.chat(message, session_id, cancel_event=cancel_event)
-            except TypeError:
-                pass
-        return app.chat(message, session_id)
+    # An exception inside a tool/turn must not replay the turn and its side effects.
+    return app.chat(message, session_id, **kwargs)
 
 
 def stream_agent_turn(

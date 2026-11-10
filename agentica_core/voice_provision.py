@@ -134,9 +134,10 @@ def stt_engine() -> str | None:
 
 def _piper_binary() -> Path | None:
     # A provisioned piper binary, or one on PATH.
-    cand = PIPER_DIR / ("piper.exe" if os.name == "nt" else "piper")
-    if cand.exists():
-        return cand
+    name = "piper.exe" if os.name == "nt" else "piper"
+    for cand in (PIPER_DIR / "runtime" / name, PIPER_DIR / name, PIPER_DIR / "piper" / name):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
     found = shutil.which("piper")
     return Path(found) if found else None
 
@@ -525,6 +526,11 @@ def install_voice(progress=lambda m: None) -> bool:
         progress(f"kokoro download failed: {exc}")
         ok = False
 
+    # Kokoro is sufficient. Do not download an unused fallback or let an
+    # optional Piper failure mark a working voice setup as broken.
+    if _kokoro_ready():
+        return ok
+
     # Piper binary
     if _piper_binary() is None:
         try:
@@ -605,21 +611,16 @@ def _download_piper(progress) -> None:
     PIPER_DIR.mkdir(parents=True, exist_ok=True)
     tgz = PIPER_DIR / "piper.tar.gz"
     _download_verified(url, tgz, progress, label=f"piper ({sysname})")
-    with tarfile.open(tgz, "r:gz") as tf:
-        # filter='data' rejects absolute paths / .. members (Zip-Slip / Python
-        # 3.12+ default; required explicitly on the 3.11 runtime).
-        try:
-            tf.extractall(PIPER_DIR, filter="data")
-        except TypeError:
-            tf.extractall(PIPER_DIR)  # very old tarfile without the filter kwarg
-    # piper tarballs extract into a "piper/" subdir — flatten it.
-    nested = PIPER_DIR / "piper" / ("piper" if os.name != "nt" else "piper.exe")
-    if nested.exists():
-        for item in (PIPER_DIR / "piper").iterdir():
-            shutil.move(str(item), str(PIPER_DIR / item.name))
-    binp = PIPER_DIR / "piper"
-    if binp.exists():
-        os.chmod(binp, 0o755)
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=PIPER_DIR, prefix="extract-") as folder:
+        with tarfile.open(tgz, "r:gz") as tf:
+            tf.extractall(folder, filter="data")
+        # Preserve library paths without moving piper/piper onto its parent directory.
+        source = Path(folder) / "piper"
+        if not (source / "piper").is_file():
+            raise VoiceUnavailable("Piper archive is missing its executable")
+        shutil.copytree(source, PIPER_DIR / "runtime", dirs_exist_ok=True)
+        os.chmod(PIPER_DIR / "runtime" / "piper", 0o755)
     tgz.unlink(missing_ok=True)
     progress("piper installed")
 

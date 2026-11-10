@@ -156,10 +156,10 @@ def test_voice_start_routes_every_model_workspace_combination(
     assert frames == [{"type": "session", "session_id": "matrix-voice-session"}]
 
 
-@pytest.mark.parametrize("legacy_mode", ["agentic", "passthrough"])
+@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("requested_model", ["served-model", "agentic", "agent"])
-def test_openai_compat_modes_and_model_aliases_all_run_agent_loop(
-    legacy_mode, requested_model,
+def test_openai_compat_streams_and_model_aliases_all_run_agent_loop(
+    stream, requested_model,
 ):
     calls = []
 
@@ -171,8 +171,6 @@ def test_openai_compat_modes_and_model_aliases_all_run_agent_loop(
     handler = gateway.make_gateway_handler(
         App(),
         auth_token=None,
-        remote_v1_base="http://plain-upstream-must-not-be-used.invalid/v1",
-        v1_mode=legacy_mode,
         model_label="served-model",
         public_api_base="http://127.0.0.1:8770/v1",
     )
@@ -191,11 +189,12 @@ def test_openai_compat_modes_and_model_aliases_all_run_agent_loop(
     handler._handle_v1(stub, {
         "model": requested_model,
         "messages": [{"role": "user", "content": "perform the task"}],
-        "stream": False,
+        "stream": stream,
     })
 
     assert calls == ["perform the task"]
-    assert payloads[0]["choices"][0]["message"]["content"] == "agent completed it"
+    answer = payloads[0]["stream"] if stream else payloads[0]["choices"][0]["message"]["content"]
+    assert answer == "agent completed it"
     assert not hasattr(handler, "_v1_passthrough")
 
 

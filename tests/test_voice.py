@@ -19,11 +19,13 @@ def test_net_guard_blocks_unsafe(bad):
         net_guard.require_safe_public_url(bad)
 
 
-def test_net_guard_allows_public_https():
+def test_net_guard_allows_public_https(monkeypatch):
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))])
     assert net_guard.require_safe_public_url("https://example.com/p") == "https://example.com/p"
 
 
-def test_agenticlocal_web_client_ssrf_guard():
+def test_agenticlocal_web_client_ssrf_guard(monkeypatch):
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))])
     import agentic_loop.tools as alt
     guard = getattr(alt, "require_public_http_url", None)
     error = getattr(alt, "UnsafeUrlError", None)
@@ -430,7 +432,31 @@ def test_install_voice_fetches_stt_weights(monkeypatch, tmp_path):
     voice.touch()
     monkeypatch.setattr(vp, "_piper_binary", lambda: piper)
     monkeypatch.setattr(vp, "_piper_voice", lambda: voice)
+    monkeypatch.setattr(vp, "_download_piper", lambda *_: pytest.fail("Kokoro needs no Piper download"))
     progress = []
     assert vp.install_voice(progress.append)
     assert calls == ["stt"]
     assert "speech-recognition model ready" in progress
+
+
+def test_type_error_inside_turn_does_not_replay_side_effects():
+    calls = []
+    class App:
+        def chat(self, message, session_id=None, **kwargs):
+            calls.append(message)
+            raise TypeError("tool failed after writing")
+    with pytest.raises(TypeError, match="tool failed"):
+        voice_stream.stream_agent_turn(App(), "edit", None, lambda _: None)
+    assert calls == ["edit"]
+
+
+def test_piper_directory_is_not_mistaken_for_an_executable(monkeypatch, tmp_path):
+    from agentica_core import voice_provision as vp
+    monkeypatch.setattr(vp, "PIPER_DIR", tmp_path)
+    monkeypatch.setattr(vp.shutil, "which", lambda _: None)
+    (tmp_path / "piper").mkdir()
+    assert vp._piper_binary() is None
+    binary = tmp_path / "piper" / "piper"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    assert vp._piper_binary() == binary
